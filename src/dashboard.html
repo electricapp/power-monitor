@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>power-monitor fleet</title>
+<style>
+  :root {
+    --bg:       #000000;
+    --fg:       #d0d0d0;
+    --dim:      #4a4a4a;
+    --dimmer:   #2a2a2a;
+    --bold:     #ffffff;
+    --cyan:     #00cdcd;
+    --green:    #00af5f;
+    --yellow:   #d7c600;
+    --red:      #d70000;
+    --panel-bg: #080808;
+    --border:   #1a1a1a;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "SF Mono", ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    font-size: 11px;
+    line-height: 1.2;
+    height: 100%;
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 12px;
+    background: var(--panel-bg);
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+  }
+  header h1 {
+    margin: 0; font-size: 11px; font-weight: 600; color: var(--bold);
+    letter-spacing: 0.5px;
+  }
+  header .status { color: var(--dim); }
+  header .status.live { color: var(--green); }
+  header .status.down { color: var(--red); }
+  header .mode { color: var(--dim); margin-left: 12px; font-size: 10px; }
+  header .mode.history { color: var(--cyan); }
+  header .hint { color: var(--dim); margin-left: 12px; font-size: 10px; }
+  main {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 6px;
+    align-content: flex-start;
+  }
+  pre.tile {
+    margin: 0;
+    padding: 2px 4px;
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    font-family: inherit;
+    font-size: inherit;
+    line-height: 1.2;
+    white-space: pre;
+    flex: 0 0 auto;
+    transition: opacity 0.2s ease, border-color 0.2s ease;
+  }
+  pre.tile.stale   { opacity: 0.55; }
+  pre.tile.offline { opacity: 0.35; border-color: var(--red); }
+  pre.tile b    { font-weight: 700; color: var(--bold); }
+  pre.tile .d   { color: var(--dim); }
+  pre.tile .dd  { color: var(--dimmer); }
+  pre.tile .c   { color: var(--cyan); }
+  pre.tile .w   { color: #ffffff; }
+  pre.tile .g   { color: var(--green); }
+  pre.tile .y   { color: var(--yellow); }
+  pre.tile .r   { color: var(--red); }
+  footer {
+    padding: 4px 12px;
+    border-top: 1px solid var(--border);
+    background: var(--panel-bg);
+    color: var(--dim);
+    font-size: 10px;
+    display: flex; justify-content: space-between;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>power-monitor fleet</h1>
+  <div>
+    <span class="status" id="status">connecting…</span>
+    <span class="mode" id="mode">live [h]</span>
+    <span class="hint">press <b>h</b> to toggle history view</span>
+  </div>
+</header>
+<main id="grid"></main>
+<footer>
+  <span id="footer-left">—</span>
+  <span id="footer-right">—</span>
+</footer>
+<script>
+(() => {
+  "use strict";
+
+  // ── Constants matching the TUI layout ─────────────────────────────────────
+  const INNER = 56;   // inner width of the box (chars between │ and │)
+  const BAR_W = 24;   // bar width in chars (matches src/main.rs BAR_W)
+
+  // Power caps — same as power_row/power_row_temp in main.rs.
+  const P_SYS  = 40;
+  const P_GPU  = 16;
+  const P_CPU  = 20;
+  const P_ANE  = 8;
+  const P_DRAM = 5;
+
+  // ── String helpers ───────────────────────────────────────────────────────
+
+  const esc = (s) => String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+
+  const repeat = (ch, n) => n > 0 ? ch.repeat(n) : '';
+
+  // Left-pad with spaces to width n.
+  const lpad = (s, n) => {
+    s = String(s);
+    return s.length >= n ? s : ' '.repeat(n - s.length) + s;
+  };
+  // Right-pad with spaces to width n.
+  const rpad = (s, n) => {
+    s = String(s);
+    return s.length >= n ? s : s + ' '.repeat(n - s.length);
+  };
+
+  // Visual-length of an HTML fragment: strips tags, collapses HTML entities
+  // (e.g. &quot; → ") back to single chars, then counts Unicode code points.
+  // Box-drawing / bar glyphs / ° all count as 1 visual column in a monospace font.
+  const visLen = (html) => {
+    const text = html
+      .replace(/<[^>]+>/g, '')
+      .replace(/&(?:#\d+|#x[\da-f]+|[a-z]+);/gi, '.'); // any entity → 1 char
+    let n = 0;
+    for (const _ of text) n++;
+    return n;
+  };
+
+  // Pad an HTML fragment on the right with spaces so its visual length = n.
+  const rpadHtml = (html, n) => {
+    const pad = Math.max(0, n - visLen(html));
+    return html + ' '.repeat(pad);
+  };
+
+  // ── Row formatting (mirrors main.rs power_row / util_row / mem_row) ──────
+
+  const heatClass = (frac) => {
+    if (frac < 0.40) return 'g';
+    if (frac < 0.75) return 'y';
+    return 'r';
+  };
+  const tempClass = (t) => {
+    if (t == null) return 'd';
+    if (t < 70) return 'g';
+    if (t < 85) return 'y';
+    return 'r';
+  };
+  const tempBadge = (t) => {
+    const txt = (t == null) ? '--' : Math.round(t);
+    return `<span class="d">(</span><span class="${tempClass(t)}">${txt}°C</span><span class="d">)</span>`;
+  };
+
+  const bar = (val, max) => {
+    const frac = Math.max(0, Math.min(1, val / max));
+    const n = Math.round(frac * BAR_W);
+    const filled = repeat('█', n);
+    const empty  = repeat('░', BAR_W - n);
+    return `<span class="${heatClass(frac)}">${filled}</span><span class="dd">${empty}</span>`;
+  };
+
+  // Left column: "  LABEL NN%  " — fixed 14 visual cols, matches left_col().
+  const leftCol = (label, pct) => {
+    const p = Math.max(0, Math.min(100, pct));
+    return `  <b>${rpad(label, 5)}</b> <span class="d">${lpad(Math.round(p), 3)}%</span>  `;
+  };
+
+  const powerRow = (label, watts, max) => {
+    const pct = (watts / max) * 100;
+    const val = `<span class="c">${lpad(watts.toFixed(2), 5)}  W</span>`;
+    return leftCol(label, pct) + bar(watts, max) + '  ' + val;
+  };
+
+  const powerRowTemp = (label, watts, max, temp) => {
+    const pct = (watts / max) * 100;
+    const val = `<span class="c">${lpad(watts.toFixed(2), 5)}  W</span>`;
+    return leftCol(label, pct) + bar(watts, max) + '  ' + val + '  ' + tempBadge(temp);
+  };
+
+  const utilRow = (label, util, freqMhz) => {
+    const pct = util * 100;
+    const val = `<span class="c">${lpad(freqMhz, 4)} MHz</span>`;
+    return leftCol(label, pct) + bar(util, 1) + '  ' + val;
+  };
+
+  const fanRow = (rpm, maxRpm) => {
+    const duty = (maxRpm > 0) ? Math.min(1, Math.max(0, rpm / maxRpm)) : 0;
+    const val = `<span class="c">${lpad(rpm, 4)} RPM</span>`;
+    return leftCol('FAN', duty * 100) + bar(duty, 1) + '  ' + val;
+  };
+
+  const gbStr = (bytes) => (bytes / (1024 ** 3)).toFixed(1);
+
+  const memRow = (label, used, total) => {
+    const frac = total > 0 ? used / total : 0;
+    const usedGb  = lpad(gbStr(used),  4);
+    const totalGb = lpad(gbStr(total), 4);
+    const val =
+      `<span class="c">${usedGb}</span> <span class="d">/ ${totalGb} GB</span>`;
+    return leftCol(label, frac * 100) + bar(frac, 1) + '  ' + val;
+  };
+
+  // ── Box helpers (mirrors main.rs box_row/box_empty/box_rule) ─────────────
+
+  const boxRow   = (content) => `<span class="d">│</span>${rpadHtml(content, INNER)}<span class="d">│</span>`;
+  const boxEmpty = ()         => `<span class="d">│${' '.repeat(INNER)}│</span>`;
+  const boxRule  = ()         => `<span class="d">│${'─'.repeat(INNER)}│</span>`;
+
+  // ── Title / footer borders ───────────────────────────────────────────────
+
+  // Top border: ╭─{title}{dashes}╮ with total visible = INNER + 2.
+  // Fixed chars: ╭─ (2) + ╮ (1) = 3.
+  const topBorder = (titleHtml) => {
+    const visible = visLen(titleHtml);
+    const pad = Math.max(0, (INNER + 2) - 3 - visible);
+    return `<span class="d">╭─</span><b>${titleHtml}</b><span class="d">${'─'.repeat(pad)}╮</span>`;
+  };
+
+  // Bottom border: ╰{left}{dashes}{right}╯. Fixed chars: ╰ (1) + ╯ (1) = 2.
+  const bottomBorder = (leftHtml, rightHtml) => {
+    const pad = Math.max(0, (INNER + 2) - 2 - visLen(leftHtml) - visLen(rightHtml));
+    return `<span class="d">╰${leftHtml}${'─'.repeat(pad)}${rightHtml}╯</span>`;
+  };
+
+  // ── Tile rendering ───────────────────────────────────────────────────────
+
+  const PLACEHOLDER = { cpu_temp_c: null, gpu_temp_c: null };
+
+  // 18 rows per tile — identical between live and history modes so toggling
+  // doesn't reflow the grid or change tile heights.
+  const TILE_ROWS = 18;
+
+  // Blank sparkline fallback when the server hasn't emitted one yet.
+  const EMPTY_SPARK = ' '.repeat(24);
+
+  // History-mode row helpers. Each swaps the bar from the corresponding
+  // live row for a same-width sparkline (24 chars) so everything else —
+  // label, pct, value column, temp badge — stays byte-identical to the
+  // TUI layout. Sparklines render in pure white so they don't blend into
+  // the cyan metric values on the right.
+  const sparkSpan = (sparkStr) =>
+    `<span class="w">${esc(sparkStr || EMPTY_SPARK)}</span>`;
+
+  const histPowerRow = (label, sparkStr, watts, max) => {
+    const pct = (watts / max) * 100;
+    const val = `<span class="c">${lpad(watts.toFixed(2), 5)}  W</span>`;
+    return leftCol(label, pct) + sparkSpan(sparkStr) + '  ' + val;
+  };
+
+  const histPowerRowTemp = (label, sparkStr, watts, max, temp) => {
+    const pct = (watts / max) * 100;
+    const val = `<span class="c">${lpad(watts.toFixed(2), 5)}  W</span>`;
+    return leftCol(label, pct) + sparkSpan(sparkStr) + '  ' + val + '  ' + tempBadge(temp);
+  };
+
+  const histUtilRow = (label, sparkStr, util, freqMhz) => {
+    const pct = util * 100;
+    const val = `<span class="c">${lpad(freqMhz, 4)} MHz</span>`;
+    return leftCol(label, pct) + sparkSpan(sparkStr) + '  ' + val;
+  };
+
+  const histFanRow = (sparkStr, rpm, maxRpm) => {
+    const duty = (maxRpm > 0) ? Math.min(1, Math.max(0, rpm / maxRpm)) : 0;
+    const val = `<span class="c">${lpad(rpm, 4)} RPM</span>`;
+    return leftCol('FAN', duty * 100) + sparkSpan(sparkStr) + '  ' + val;
+  };
+
+  // Dimmed placeholder used when fan_max_rpm is 0 (fanless hardware). Keeps
+  // tile height consistent across mixed fleets.
+  const fanlessRow = () =>
+    `  <b>FAN</b>  <span class="d">  —</span>  <span class="d">${'─'.repeat(BAR_W)}</span>  <span class="d">fanless</span>`;
+
+  // Memory history row: same layout as memRow (live), just swap the bar
+  // for a sparkline. The right-hand "used / total GB" column stays.
+  const histMemRow = (label, sparkStr, used, total) => {
+    const frac = total > 0 ? used / total : 0;
+    const usedGb  = lpad(gbStr(used),  4);
+    const totalGb = lpad(gbStr(total), 4);
+    const val =
+      `<span class="c">${usedGb}</span> <span class="d">/ ${totalGb} GB</span>`;
+    return leftCol(label, frac * 100) + sparkSpan(sparkStr) + '  ' + val;
+  };
+
+  const offlineTileHtml = (host) => {
+    const titleText = ` ${host.label} · offline `;
+    const title = `<span class="r">${esc(titleText)}</span>`;
+    const rows = [topBorder(title)];
+
+    const pushCentered = (html) => {
+      const vl = visLen(html);
+      const leftPad = Math.floor((INNER - vl) / 2);
+      const rightPad = INNER - vl - leftPad;
+      rows.push(
+        `<span class="d">│</span>${' '.repeat(leftPad)}${html}${' '.repeat(rightPad)}<span class="d">│</span>`
+      );
+    };
+
+    rows.push(boxEmpty());
+    rows.push(boxEmpty());
+    rows.push(boxEmpty());
+    rows.push(boxEmpty());
+    rows.push(boxEmpty());
+    pushCentered(`<span class="r">OFFLINE</span>`);
+    if (host.error) {
+      const msg = host.error.length > INNER - 4 ? host.error.slice(0, INNER - 7) + '...' : host.error;
+      pushCentered(`<span class="d">${esc(msg)}</span>`);
+    } else {
+      rows.push(boxEmpty());
+    }
+    pushCentered(`<span class="d">${esc(host.target)}</span>`);
+    while (rows.length < TILE_ROWS - 1) rows.push(boxEmpty());
+    rows.push(bottomBorder(` <span class="d">${esc(host.target)}</span> `, ` <span class="d">no data</span> `));
+    return rows.join('\n');
+  };
+
+  // Parse a UTC ISO-8601 timestamp (e.g. "2026-04-09T12:34:56Z") and return
+  // "HH:MM DD-Mon" in the viewer's local timezone — same visual format as
+  // the TUI footer (which uses localtime_r on the agent side).
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const formatSampleTime = (iso) => {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return '—';
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${hh}:${mm} ${dd}-${MONTHS[d.getMonth()]}`;
+  };
+
+  const liveTileHtml = (host) => {
+    const m = host.metrics;
+    const totalGb = Math.round((m.memory_total_bytes || 0) / (1024 ** 3));
+    // Title matches TUI main.rs exactly:
+    //   " v{version} · {chip} · {pcpu}P + {ecpu}E · {gpu} GPU · {ram}GB "
+    const pcpu = m.pcpu_cores ?? 0;
+    const ecpu = m.ecpu_cores ?? 0;
+    const gpu  = m.gpu_cores  ?? 0;
+    const version = m.version || '?';
+    const titleText = gpu > 0
+      ? ` v${version} · ${m.chip || '?'} · ${pcpu}P + ${ecpu}E · ${gpu} GPU · ${totalGb}GB `
+      : ` v${version} · ${m.chip || '?'} · ${pcpu}P + ${ecpu}E · ${totalGb}GB `;
+    const title = esc(titleText);
+
+    const rows = [];
+    rows.push(topBorder(title));
+    rows.push(boxEmpty());
+    rows.push(boxRow(powerRow('SYS', m.sys_power, P_SYS)));
+    rows.push(boxRow((m.fan_max_rpm > 0)
+      ? fanRow(m.fan_rpm || 0, m.fan_max_rpm)
+      : fanlessRow()));
+    rows.push(boxRule());
+    rows.push(boxRow(powerRowTemp('GPU', m.gpu_power, P_GPU, m.gpu_temp_c)));
+    rows.push(boxRow(powerRowTemp('CPU', m.cpu_power, P_CPU, m.cpu_temp_c)));
+    rows.push(boxRow(powerRow('ANE', m.ane_power, P_ANE)));
+    rows.push(boxRow(powerRow('DRAM', m.dram_power, P_DRAM)));
+    rows.push(boxEmpty());
+    rows.push(boxRow(utilRow('PCPU', m.pcpu_util, m.pcpu_freq_mhz)));
+    rows.push(boxRow(utilRow('ECPU', m.ecpu_util, m.ecpu_freq_mhz)));
+    rows.push(boxRow(utilRow('GPU',  m.gpu_util,  m.gpu_freq_mhz)));
+    rows.push(boxEmpty());
+    rows.push(boxRow(memRow('MEM',  m.memory_used_bytes, m.memory_total_bytes)));
+    rows.push(boxRow(memRow('SWAP', m.swap_used_bytes,   m.swap_total_bytes)));
+    rows.push(boxEmpty());
+
+    // Footer matches TUI main.rs exactly:
+    //   ╰ "hostname" HH:MM DD-Mon ──── {interval_ms} ms ╯
+    const hostLabel = m.hostname || host.label;
+    const sampleTime = formatSampleTime(m.timestamp);
+    const leftText = ` "${hostLabel}" ${sampleTime} `;
+    const rightText = ` ${m.interval_ms} ms `;
+    const left  = `<span class="d">${esc(leftText)}</span>`;
+    const right = `<span class="d">${esc(rightText)}</span>`;
+    rows.push(bottomBorder(left, right));
+
+    return rows.join('\n');
+  };
+
+  // History-mode tile: identical to the live tile except every bar row has
+  // its bar replaced with a same-width sparkline (24 chars). The leading
+  // label / percentage column, the value column, temp badges, MEM/SWAP
+  // rows, title, and footer are all byte-identical to the live tile, so
+  // switching modes never reflows the grid.
+  const historyTileHtml = (host) => {
+    const m = host.metrics;
+    const spark = host.spark || {};
+
+    const totalGb = Math.round((m.memory_total_bytes || 0) / (1024 ** 3));
+    const pcpu = m.pcpu_cores ?? 0;
+    const ecpu = m.ecpu_cores ?? 0;
+    const gpu  = m.gpu_cores  ?? 0;
+    const version = m.version || '?';
+    const titleText = gpu > 0
+      ? ` v${version} · ${m.chip || '?'} · ${pcpu}P + ${ecpu}E · ${gpu} GPU · ${totalGb}GB `
+      : ` v${version} · ${m.chip || '?'} · ${pcpu}P + ${ecpu}E · ${totalGb}GB `;
+    const title = esc(titleText);
+
+    const rows = [];
+    rows.push(topBorder(title));
+    rows.push(boxEmpty());
+    rows.push(boxRow(histPowerRow('SYS', spark.sys, m.sys_power, P_SYS)));
+    rows.push(boxRow((m.fan_max_rpm > 0)
+      ? histFanRow(spark.fan, m.fan_rpm || 0, m.fan_max_rpm)
+      : fanlessRow()));
+    rows.push(boxRule());
+    rows.push(boxRow(histPowerRowTemp('GPU', spark.gpu, m.gpu_power, P_GPU, m.gpu_temp_c)));
+    rows.push(boxRow(histPowerRowTemp('CPU', spark.cpu, m.cpu_power, P_CPU, m.cpu_temp_c)));
+    rows.push(boxRow(histPowerRow('ANE', spark.ane, m.ane_power, P_ANE)));
+    rows.push(boxRow(histPowerRow('DRAM', spark.dram, m.dram_power, P_DRAM)));
+    rows.push(boxEmpty());
+    rows.push(boxRow(histUtilRow('PCPU', spark.pcpu_util, m.pcpu_util, m.pcpu_freq_mhz)));
+    rows.push(boxRow(histUtilRow('ECPU', spark.ecpu_util, m.ecpu_util, m.ecpu_freq_mhz)));
+    rows.push(boxRow(histUtilRow('GPU',  spark.gpu_util,  m.gpu_util,  m.gpu_freq_mhz)));
+    rows.push(boxEmpty());
+    rows.push(boxRow(histMemRow('MEM',  spark.mem,  m.memory_used_bytes, m.memory_total_bytes)));
+    rows.push(boxRow(histMemRow('SWAP', spark.swap, m.swap_used_bytes,   m.swap_total_bytes)));
+    rows.push(boxEmpty());
+
+    // Footer identical to live mode.
+    const hostLabel = m.hostname || host.label;
+    const sampleTime = formatSampleTime(m.timestamp);
+    const leftText = ` "${hostLabel}" ${sampleTime} `;
+    const rightText = ` ${m.interval_ms} ms `;
+    const left  = `<span class="d">${esc(leftText)}</span>`;
+    const right = `<span class="d">${esc(rightText)}</span>`;
+    rows.push(bottomBorder(left, right));
+
+    return rows.join('\n');
+  };
+
+  // Convert stale_s to a tile class.
+  const tileClass = (host) => {
+    if (!host.metrics) return 'tile offline';
+    const intervalS = (host.metrics.interval_ms || 1000) / 1000;
+    if (host.stale_s == null) return 'tile';
+    if (host.stale_s > 10 * intervalS) return 'tile offline';
+    if (host.stale_s > 3 * intervalS)  return 'tile stale';
+    return 'tile';
+  };
+
+  // ── Wire it up ───────────────────────────────────────────────────────────
+
+  const grid = document.getElementById('grid');
+  const statusEl = document.getElementById('status');
+  const modeEl = document.getElementById('mode');
+  const footerLeft = document.getElementById('footer-left');
+  const footerRight = document.getElementById('footer-right');
+
+  // Keyed DOM nodes by host target for in-place updates (no flicker).
+  const tiles = new Map();
+
+  // View mode: 'live' shows bar rows, 'history' swaps every bar for a
+  // same-width sparkline. Toggled with the `h` key. Kiosks can boot
+  // straight into history mode via `?mode=history`.
+  const qs = new URLSearchParams(window.location.search);
+  let viewMode = qs.get('mode') === 'history' ? 'history' : 'live';
+  let lastPayload = null;
+
+  const updateModeIndicator = () => {
+    if (!modeEl) return;
+    modeEl.textContent = viewMode === 'history' ? 'history [h]' : 'live [h]';
+    modeEl.className = viewMode === 'history' ? 'mode history' : 'mode';
+  };
+
+  const upsertTile = (host) => {
+    let el = tiles.get(host.target);
+    if (!el) {
+      el = document.createElement('pre');
+      grid.appendChild(el);
+      tiles.set(host.target, el);
+    }
+    el.className = tileClass(host);
+    if (!host.metrics) {
+      el.innerHTML = offlineTileHtml(host);
+    } else if (viewMode === 'history') {
+      el.innerHTML = historyTileHtml(host);
+    } else {
+      el.innerHTML = liveTileHtml(host);
+    }
+  };
+
+  const renderFleet = (payload) => {
+    lastPayload = payload;
+    const seen = new Set();
+    for (const host of payload.hosts) {
+      seen.add(host.target);
+      upsertTile(host);
+    }
+    for (const [target, el] of tiles) {
+      if (!seen.has(target)) {
+        el.remove();
+        tiles.delete(target);
+      }
+    }
+    footerLeft.textContent  = `${payload.hosts.length} host${payload.hosts.length === 1 ? '' : 's'} · poll ${payload.poll_interval_ms} ms · ${viewMode}`;
+    footerRight.textContent = payload.generated_at;
+  };
+
+  // Keyboard: `h` (or `H`) toggles between live and history view.
+  document.addEventListener('keydown', (ev) => {
+    const t = ev.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
+    if (ev.key === 'h' || ev.key === 'H') {
+      viewMode = viewMode === 'history' ? 'live' : 'history';
+      updateModeIndicator();
+      if (lastPayload) renderFleet(lastPayload);
+      ev.preventDefault();
+    }
+  });
+
+  const connect = () => {
+    const es = new EventSource('/stream');
+    es.onopen = () => {
+      statusEl.className = 'status live';
+      statusEl.textContent = '● live';
+    };
+    es.onmessage = (ev) => {
+      try {
+        const payload = JSON.parse(ev.data);
+        renderFleet(payload);
+      } catch (e) {
+        console.error('parse error', e);
+      }
+    };
+    es.onerror = () => {
+      statusEl.className = 'status down';
+      statusEl.textContent = '● reconnecting…';
+    };
+  };
+
+  updateModeIndicator();
+  connect();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,58 @@
+[package]
+name = "power-monitor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "macOS Apple Silicon power/performance monitoring via IOKit SMC and IOReport FFI"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["power", "monitoring", "macos", "apple-silicon", "performance"]
+categories = ["os", "hardware-support"]
+# docs.rs URL is deterministic from the crate name — safe to ship even before
+# the repo is public. `repository` / `homepage` get filled in at publish time.
+documentation = "https://docs.rs/power-monitor"
+# TODO set `repository` and `homepage` to the public repo URL before first publish.
+# repository = "https://github.com/YOUR-ORG/power-monitor"
+# homepage = "https://github.com/YOUR-ORG/power-monitor"
+
+# Keep the published tarball minimal — no Swift menu bar app, no build output,
+# no generated PNGs. Crate consumers only need Rust sources + headers.
+exclude = [
+    "app/",
+    "target/",
+    "build/",
+    "*.png",
+    ".DS_Store",
+]
+
+[[bin]]
+name = "power-monitor"
+path = "src/main.rs"
+
+# Standalone tools live in `tools/` (not `src/bin/`); they're not part
+# of the published runtime surface but are useful for development.
+[[bin]]
+name = "probe"
+path = "tools/probe.rs"
+
+[lib]
+name = "power_monitor"
+path = "src/lib.rs"
+crate-type = ["rlib", "staticlib"]
+
+[workspace]
+
+[dependencies]
+
+# Criterion is dev-only; the published crate has zero runtime deps.
+# Default features disabled to avoid pulling rayon + plotters; the plain-text
+# output is enough for this project. Run with `cargo bench`.
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false }
+
+[[bench]]
+name = "hot_paths"
+harness = false
+
+[package.metadata.docs.rs]
+targets = ["aarch64-apple-darwin"]
