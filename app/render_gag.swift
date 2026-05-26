@@ -369,7 +369,8 @@ CGImageDestinationSetProperties(dest, gifProperties as CFDictionary)
 
 let frameProperties: [String: Any] = [
     kCGImagePropertyGIFDictionary as String: [
-        kCGImagePropertyGIFDelayTime as String: frameDelay
+        kCGImagePropertyGIFDelayTime as String: frameDelay,
+        kCGImagePropertyGIFUnclampedDelayTime as String: frameDelay
     ]
 ]
 
