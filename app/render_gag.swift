@@ -1,12 +1,15 @@
 #!/usr/bin/env swift
-// Render a gag PNG of `power-monitor` showing an imaginary "Apple M5 Ultra"
-// at 1 TB RAM under heavy load. Output → ~/Downloads/m5-ultra-gag.png.
+// Render an animated GIF of `power-monitor` showing an imaginary "Apple M5 Ultra"
+// at 1 TB RAM under heavy load with realistic fluctuating values.
+// Output → ~/Downloads/m5-ultra-gag.gif
 //
 // Standalone: no FFI, no Rust library — pure Swift + AppKit with local
 // struct + Renderer copies so `swift render_gag.swift` Just Works.
 
 import AppKit
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 // MARK: - Local value types (mirror the C ABI structs)
 
@@ -32,24 +35,24 @@ struct PmSocInfo {
 // MARK: - Fake data (M5 Ultra extrapolation under heavy load)
 
 let soc = PmSocInfo(
-    pcpu_cores: 32,           // 2× M4 Ultra perf cores
+    pcpu_cores: 32,
     ecpu_cores: 8,
-    gpu_cores: 80,            // M4 Ultra has 76; round-up extrapolation
-    total_ram: UInt64(1024) * (1 << 30)   // 1 TB
+    gpu_cores: 80,
+    total_ram: UInt64(1024) * (1 << 30)
 )
 
-let metrics = PmMetrics(
+let base = PmMetrics(
     sys_power: 268.4,
     cpu_power: 78.9,
     gpu_power: 142.1,
     ane_power: 6.3,
     dram_power: 14.7,
-    cpu_temp: 94.0,           // red
-    gpu_temp: 88.0,           // red
+    cpu_temp: 94.0,
+    gpu_temp: 88.0,
     pcpu_util: 0.98, pcpu_mhz: 5200,
     ecpu_util: 0.84, ecpu_mhz: 3100,
     gpu_util:  0.96, gpu_mhz:  2100,
-    mem_used:  UInt64(964) * (1 << 30),    // 964 GB of 1 TB
+    mem_used:  UInt64(964) * (1 << 30),
     mem_total: UInt64(1024) * (1 << 30),
     swap_used: UInt64(12)  * (1 << 30),
     swap_total: UInt64(16) * (1 << 30),
@@ -60,26 +63,67 @@ let metrics = PmMetrics(
 let chip = "Apple M5 Ultra"
 let host = "cosmos"
 
+// MARK: - Organic fluctuation
+
+func wobble(_ base: Float, amplitude: Float, frame: Int, phase: Double) -> Float {
+    let t = Double(frame)
+    let v = sin(t * 0.15 + phase) * 0.6
+        + sin(t * 0.37 + phase * 1.7) * 0.25
+        + sin(t * 0.73 + phase * 0.3) * 0.15
+    return base + amplitude * Float(v)
+}
+
+func clamp01(_ v: Float) -> Float { min(max(v, 0), 1) }
+
+func metricsForFrame(_ i: Int) -> PmMetrics {
+    var m = base
+    m.cpu_power  = max(0, wobble(base.cpu_power,  amplitude: 12, frame: i, phase: 0.0))
+    m.gpu_power  = max(0, wobble(base.gpu_power,  amplitude: 18, frame: i, phase: 1.3))
+    m.ane_power  = max(0, wobble(base.ane_power,  amplitude: 2.5, frame: i, phase: 2.7))
+    m.dram_power = max(0, wobble(base.dram_power, amplitude: 3,  frame: i, phase: 3.1))
+    m.sys_power  = m.cpu_power + m.gpu_power + m.ane_power + m.dram_power + wobble(26, amplitude: 4, frame: i, phase: 4.0)
+
+    m.cpu_temp = wobble(base.cpu_temp, amplitude: 4, frame: i, phase: 0.5)
+    m.gpu_temp = wobble(base.gpu_temp, amplitude: 3, frame: i, phase: 1.8)
+
+    m.pcpu_util = clamp01(wobble(base.pcpu_util, amplitude: 0.06, frame: i, phase: 0.2))
+    m.ecpu_util = clamp01(wobble(base.ecpu_util, amplitude: 0.10, frame: i, phase: 1.0))
+    m.gpu_util  = clamp01(wobble(base.gpu_util,  amplitude: 0.08, frame: i, phase: 1.5))
+
+    let pcpuOptions: [UInt32] = [5000, 5100, 5200, 5200, 5200, 5300]
+    let ecpuOptions: [UInt32] = [2900, 3000, 3100, 3100, 3100, 3200]
+    let gpuOptions:  [UInt32] = [2000, 2050, 2100, 2100, 2100, 2150]
+    let fi = abs(i) % 60
+    m.pcpu_mhz = pcpuOptions[fi % pcpuOptions.count]
+    m.ecpu_mhz = ecpuOptions[(fi + 2) % ecpuOptions.count]
+    m.gpu_mhz  = gpuOptions[(fi + 4) % gpuOptions.count]
+
+    let memDelta = Int64(wobble(0, amplitude: 2, frame: i, phase: 5.0) * Float(1 << 30))
+    m.mem_used = UInt64(clamping: Int64(base.mem_used) + memDelta)
+    let swapDelta = Int64(wobble(0, amplitude: 0.5, frame: i, phase: 6.0) * Float(1 << 30))
+    m.swap_used = UInt64(clamping: Int64(base.swap_used) + swapDelta)
+
+    m.fan_rpm = UInt32(clamping: Int32(base.fan_rpm) + Int32(wobble(0, amplitude: 200, frame: i, phase: 3.5)))
+
+    m.interval_ms = wobble(1002, amplitude: 8, frame: i, phase: 7.0)
+
+    return m
+}
+
 // MARK: - Renderer (mirror of app/PowerMonitorMenuBar.swift)
 
 enum Renderer {
-    // Widen slightly vs. the live dashboard (56) so 3-digit watts and a
-    // 1 TB memory row don't shove the right border out of alignment.
     static let INNER = 60
     static let BAR_W = 24
 
-    // Version — read Cargo.toml at runtime so this script can't drift
-    // from the crate it purports to render. Same source of truth that
-    // `pm_version()` pulls from via `env!("CARGO_PKG_VERSION")`.
     static let version: String = {
         let cargoPath = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()   // app/
-            .deletingLastPathComponent()   // power-monitor/
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
             .appendingPathComponent("Cargo.toml")
         guard let contents = try? String(contentsOf: cargoPath, encoding: .utf8) else { return "?" }
         for raw in contents.split(separator: "\n") {
             let line = raw.trimmingCharacters(in: .whitespaces)
-            // Match only `version = "..."` at the package level (first hit).
             if line.hasPrefix("version") {
                 let parts = line.split(separator: "\"")
                 if parts.count >= 2 { return String(parts[1]) }
@@ -95,10 +139,6 @@ enum Renderer {
     static let dim    = NSColor(white: 0.48, alpha: 1)
     static let fg     = NSColor(white: 0.92, alpha: 1)
 
-    // Menlo has a complete box-drawing block at consistent monospace widths;
-    // `.monospacedSystemFont` (SF Mono) falls back to proportional glyphs for
-    // `│ ─ ╭ ╮ ╰ ╯`, which breaks the grid.
-    // NSFont isn't Sendable; script is single-threaded so the marker is safe.
     nonisolated(unsafe) static let mono     = NSFont(name: "Menlo", size: 13)!
     nonisolated(unsafe) static let monoBold = NSFont(name: "Menlo-Bold", size: 13)!
 
@@ -255,64 +295,99 @@ enum Renderer {
     }
 }
 
-// MARK: - Attributed string → PNG via NSTextView
+// MARK: - Render one frame to CGImage
 
-let ns = Renderer.frame(m: metrics, soc: soc, chip: chip, host: host)
+func renderFrame(_ i: Int) -> CGImage {
+    let m = metricsForFrame(i)
+    let ns = Renderer.frame(m: m, soc: soc, chip: chip, host: host)
 
-let padding: CGFloat = 28
-let measured = ns.boundingRect(
-    with: NSSize(width: 2000, height: 4000),
-    options: [.usesLineFragmentOrigin]
-)
-let imgSize = NSSize(
-    width: ceil(measured.width) + padding * 2,
-    height: ceil(measured.height) + padding * 2
-)
-
-let textView = NSTextView(frame: NSRect(origin: .zero, size: imgSize))
-textView.isEditable = false
-textView.isSelectable = false
-textView.drawsBackground = true
-textView.backgroundColor = NSColor(white: 0.07, alpha: 1)
-textView.textContainerInset = NSSize(width: padding, height: padding)
-
-// Critical: NSTextContainer defaults to lineFragmentPadding=5 and a fixed
-// width that tracks the view. Both cause mid-line wrapping that eats the
-// right-side box border and corner glyphs. Disable both.
-if let container = textView.textContainer {
-    container.lineFragmentPadding = 0
-    container.widthTracksTextView = false
-    container.heightTracksTextView = false
-    container.size = NSSize(
-        width: CGFloat.greatestFiniteMagnitude,
-        height: CGFloat.greatestFiniteMagnitude
+    let padding: CGFloat = 28
+    let measured = ns.boundingRect(
+        with: NSSize(width: 2000, height: 4000),
+        options: [.usesLineFragmentOrigin]
     )
+    let imgSize = NSSize(
+        width: ceil(measured.width) + padding * 2,
+        height: ceil(measured.height) + padding * 2
+    )
+
+    let textView = NSTextView(frame: NSRect(origin: .zero, size: imgSize))
+    textView.isEditable = false
+    textView.isSelectable = false
+    textView.drawsBackground = true
+    textView.backgroundColor = NSColor(white: 0.07, alpha: 1)
+    textView.textContainerInset = NSSize(width: padding, height: padding)
+
+    if let container = textView.textContainer {
+        container.lineFragmentPadding = 0
+        container.widthTracksTextView = false
+        container.heightTracksTextView = false
+        container.size = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+    }
+
+    textView.textStorage?.setAttributedString(ns)
+
+    if let container = textView.textContainer, let lm = textView.layoutManager {
+        lm.ensureLayout(for: container)
+    }
+
+    guard let rep = textView.bitmapImageRepForCachingDisplay(in: textView.bounds) else {
+        fputs("error: could not build bitmap rep for frame \(i)\n", stderr)
+        exit(1)
+    }
+    textView.cacheDisplay(in: textView.bounds, to: rep)
+
+    guard let cgImage = rep.cgImage else {
+        fputs("error: could not get CGImage for frame \(i)\n", stderr)
+        exit(1)
+    }
+    return cgImage
 }
 
-textView.textStorage?.setAttributedString(ns)
+// MARK: - Assemble animated GIF
 
-// Force layout so the image rep captures the text.
-if let container = textView.textContainer, let lm = textView.layoutManager {
-    lm.ensureLayout(for: container)
-}
+let frameCount = 60
+let frameDelay: Double = 0.15  // 150ms per frame → ~9s loop
 
-guard let rep = textView.bitmapImageRepForCachingDisplay(in: textView.bounds) else {
-    fputs("error: could not build bitmap rep\n", stderr)
+let outPath = (NSHomeDirectory() as NSString).appendingPathComponent("Downloads/m5-ultra-gag.gif")
+let outURL = URL(fileURLWithPath: outPath) as CFURL
+
+guard let dest = CGImageDestinationCreateWithURL(outURL, "com.compuserve.gif" as CFString, frameCount, nil) else {
+    fputs("error: could not create GIF destination\n", stderr)
     exit(1)
 }
-textView.cacheDisplay(in: textView.bounds, to: rep)
 
-guard let png = rep.representation(using: .png, properties: [:]) else {
-    fputs("error: could not encode PNG\n", stderr)
+let gifProperties: [String: Any] = [
+    kCGImagePropertyGIFDictionary as String: [
+        kCGImagePropertyGIFLoopCount as String: 0  // loop forever
+    ]
+]
+CGImageDestinationSetProperties(dest, gifProperties as CFDictionary)
+
+let frameProperties: [String: Any] = [
+    kCGImagePropertyGIFDictionary as String: [
+        kCGImagePropertyGIFDelayTime as String: frameDelay
+    ]
+]
+
+for i in 0..<frameCount {
+    let img = renderFrame(i)
+    CGImageDestinationAddImage(dest, img, frameProperties as CFDictionary)
+    if (i + 1) % 10 == 0 {
+        print("Rendered \(i + 1)/\(frameCount) frames")
+    }
+}
+
+guard CGImageDestinationFinalize(dest) else {
+    fputs("error: could not finalize GIF\n", stderr)
     exit(1)
 }
 
-let out = (NSHomeDirectory() as NSString).appendingPathComponent("Downloads/m5-ultra-gag.png")
-do {
-    try png.write(to: URL(fileURLWithPath: out))
-    print("Wrote: \(out)")
-    print("Size:  \(Int(imgSize.width))x\(Int(imgSize.height))")
-} catch {
-    fputs("error: \(error)\n", stderr)
-    exit(1)
-}
+let attrs = try? FileManager.default.attributesOfItem(atPath: outPath)
+let size = (attrs?[.size] as? Int) ?? 0
+print("Wrote: \(outPath)")
+print("Frames: \(frameCount) @ \(Int(frameDelay * 1000))ms = \(String(format: "%.1f", Double(frameCount) * frameDelay))s loop")
+print("Size: \(size / 1024) KB")

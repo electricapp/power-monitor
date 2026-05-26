@@ -3,7 +3,7 @@
 Rust library and native macOS Menu Bar app (Swift) for zero-subprocess, sudoless Apple Silicon power and performance monitoring via FFI to AppleSMC, libIOReport, and IOKit.
 
 <p align="center">
-  <img src="assets/m5-ultra-gag.png" alt="power-monitor dashboard showing a fictional Apple M5 Ultra under heavy load" width="542" />
+  <img src="assets/m5-ultra-gag.gif" alt="power-monitor dashboard showing a fictional Apple M5 Ultra under heavy load" width="542" />
 </p>
 
 Reads power, temperature, fan RPM, CPU/GPU utilisation, CPU/GPU frequency, voltage, current, battery state, and RAM/swap.
@@ -33,9 +33,7 @@ fn main() {
 | `MultiGroupSampler`            | IOReport multi-group              | Energy Model + CPU Stats + GPU Stats in one subscription handle      |
 | `Sampler`                      | All of the above                  | Averaged `Metrics` snapshot over a configurable time window          |
 | `SocInfo`                      | sysctl + IOKit                    | Chip name, core counts, CPU/GPU frequency tables                     |
-| `read_memory`                  | Mach `host_statistics64` + sysctl | Physical RAM and swap file statistics                                |
-
-| / `read_swap`
+| `read_memory` / `read_swap`    | Mach `host_statistics64` + sysctl | Physical RAM and swap file statistics                                |
 
 ## What it reads
 
