@@ -349,8 +349,8 @@ func renderFrame(_ i: Int) -> CGImage {
 
 // MARK: - Assemble animated GIF
 
-let frameCount = 60
-let frameDelay: Double = 0.15  // 150ms per frame → ~9s loop
+let frameCount = 20
+let frameDelay: Double = 1.0
 
 let outPath = (NSHomeDirectory() as NSString).appendingPathComponent("Downloads/m5-ultra-gag.gif")
 let outURL = URL(fileURLWithPath: outPath) as CFURL
