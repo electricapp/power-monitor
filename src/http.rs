@@ -45,6 +45,10 @@ pub const MAX_INFLIGHT: usize = 16;
 pub fn read_request_head(stream: &mut impl Read) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
+    // High-water mark of bytes already scanned for the terminator. Each new
+    // chunk only re-checks from `scanned - 3`, so a terminator straddling a
+    // read boundary is still caught while the search stays O(total bytes).
+    let mut scanned = 0usize;
     while buf.len() < MAX_HEADER_BYTES {
         let n = match stream.read(&mut chunk) {
             Ok(0) => break,
@@ -52,9 +56,11 @@ pub fn read_request_head(stream: &mut impl Read) -> Vec<u8> {
             Err(_) => break,
         };
         buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        let from = scanned.saturating_sub(3);
+        if buf[from..].windows(4).any(|w| w == b"\r\n\r\n") {
             break;
         }
+        scanned = buf.len();
     }
     buf
 }

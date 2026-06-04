@@ -297,6 +297,10 @@ enum Renderer {
 
 // MARK: - Render one frame to CGImage
 
+// Builds an NSTextView, so it must run on the main actor (AppKit views are
+// MainActor-isolated under complete concurrency checking). The top-level
+// driver loop is already main-actor isolated, so this composes cleanly.
+@MainActor
 func renderFrame(_ i: Int) -> CGImage {
     let m = metricsForFrame(i)
     let ns = Renderer.frame(m: m, soc: soc, chip: chip, host: host)

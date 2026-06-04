@@ -207,6 +207,97 @@ fn write_temp_field<W: std::fmt::Write>(out: &mut W, name: &str, t: f32) -> std:
     }
 }
 
+// ── Prometheus gauge catalog ──────────────────────────────────────────────────
+
+/// One Prometheus gauge: `(metric suffix, help text, value extractor)`.
+pub type PromGauge = (&'static str, &'static str, fn(&Metrics) -> f64);
+
+/// Canonical Prometheus gauge catalog.
+///
+/// Single source of truth shared by the single-host (`serve`) and fleet
+/// (`collect`) exporters so their metric names, help strings, and units can't
+/// drift apart. The `power_monitor_` prefix is added by the writer; NaN values
+/// (rail-gated temps) are skipped at the sample line, never the `# HELP`/`# TYPE`
+/// header. `all_power` is intentionally absent — it's a JSON convenience field,
+/// not a gauge.
+pub const PROM_GAUGES: &[PromGauge] = &[
+    ("sys_power_watts", "Total system power draw in watts", |m| {
+        m.sys_power as f64
+    }),
+    ("cpu_power_watts", "CPU power draw in watts", |m| {
+        m.cpu_power as f64
+    }),
+    ("gpu_power_watts", "GPU power draw in watts", |m| {
+        m.gpu_power as f64
+    }),
+    (
+        "ane_power_watts",
+        "Apple Neural Engine power draw in watts",
+        |m| m.ane_power as f64,
+    ),
+    ("dram_power_watts", "DRAM power draw in watts", |m| {
+        m.dram_power as f64
+    }),
+    (
+        "ecpu_utilization",
+        "Efficiency CPU cluster utilization (0-1)",
+        |m| m.ecpu.utilization as f64,
+    ),
+    (
+        "pcpu_utilization",
+        "Performance CPU cluster utilization (0-1)",
+        |m| m.pcpu.utilization as f64,
+    ),
+    ("gpu_utilization", "GPU utilization (0-1)", |m| {
+        m.gpu_util as f64
+    }),
+    (
+        "ecpu_freq_mhz",
+        "Efficiency CPU cluster weighted average frequency in MHz",
+        |m| m.ecpu.freq_mhz as f64,
+    ),
+    (
+        "pcpu_freq_mhz",
+        "Performance CPU cluster weighted average frequency in MHz",
+        |m| m.pcpu.freq_mhz as f64,
+    ),
+    (
+        "gpu_freq_mhz",
+        "GPU weighted average frequency in MHz",
+        |m| m.gpu_freq_mhz as f64,
+    ),
+    (
+        "cpu_temp_celsius",
+        "CPU temperature in degrees Celsius",
+        |m| m.cpu_temp as f64,
+    ),
+    (
+        "gpu_temp_celsius",
+        "GPU temperature in degrees Celsius",
+        |m| m.gpu_temp as f64,
+    ),
+    ("fan_rpm", "Highest-duty fan current RPM (0 if fanless)", |m| {
+        m.fan_rpm as f64
+    }),
+    (
+        "fan_max_rpm",
+        "Highest-duty fan max RPM (0 if fanless)",
+        |m| m.fan_max_rpm as f64,
+    ),
+    ("memory_used_bytes", "Physical RAM used in bytes", |m| {
+        m.memory.used as f64
+    }),
+    ("memory_total_bytes", "Physical RAM total in bytes", |m| {
+        m.memory.total as f64
+    }),
+    ("swap_used_bytes", "Swap used in bytes", |m| {
+        m.swap.used as f64
+    }),
+    ("swap_total_bytes", "Swap total in bytes", |m| {
+        m.swap.total as f64
+    }),
+];
+
 /// JSON-escape `s` into `out`. Handles the standard escapes plus control chars.
 pub fn write_escape_json<W: std::fmt::Write>(out: &mut W, s: &str) -> std::fmt::Result {
     for ch in s.chars() {

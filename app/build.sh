@@ -9,6 +9,29 @@ CRATE_DIR="$(cd .. && pwd)"
 BUILD_DIR="build"
 APP_DIR="$BUILD_DIR/PowerMonitorMenuBar.app"
 
+# 0. Build-time layout guard — fails fast if a dashboard row can overflow the
+#    box (e.g. a 3-digit ≥100 °C temperature). FFI-free, so it needs no staticlib
+#    and runs before the slower cargo/app build. Mirrors the Rust regression test.
+mkdir -p "$BUILD_DIR"
+echo ">> swiftc layout check (BoxLayout.swift + layout_check.swift)"
+swiftc -O \
+    -target arm64-apple-macos13.0 \
+    -parse-as-library \
+    -warnings-as-errors \
+    -strict-concurrency=complete \
+    -enable-upcoming-feature ExistentialAny \
+    -enable-upcoming-feature ConciseMagicFile \
+    -enable-upcoming-feature ForwardTrailingClosures \
+    -enable-upcoming-feature BareSlashRegexLiterals \
+    -enable-upcoming-feature ImplicitOpenExistentials \
+    -enable-upcoming-feature DisableOutwardActorInference \
+    -enable-upcoming-feature InferSendableFromCaptures \
+    -enable-upcoming-feature IsolatedDefaultValues \
+    -enable-upcoming-feature GlobalConcurrency \
+    -o "$BUILD_DIR/layout_check" \
+    BoxLayout.swift layout_check.swift
+"$BUILD_DIR/layout_check"
+
 # 1. Build the Rust static lib.
 echo ">> cargo build --release -p power-monitor"
 (cd "$CRATE_DIR" && cargo build --release)
@@ -45,6 +68,7 @@ swiftc -O \
     -framework CoreFoundation \
     -lIOReport \
     -o "$BUILD_DIR/PowerMonitorMenuBar" \
+    BoxLayout.swift \
     PowerMonitorMenuBar.swift
 
 # 3. Assemble the .app bundle.

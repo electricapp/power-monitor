@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use crate::http::{
     MAX_INFLIGHT, extract_bearer, extract_path, http_response, read_request_head, try_acquire,
 };
+use power_monitor::Metrics;
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 
@@ -621,6 +622,35 @@ fn write_escape_json(out: &mut String, s: &str) {
 
 // ── Prometheus aggregation ───────────────────────────────────────────────────
 
+/// Inflate a flat [`ParsedSample`] back into a [`Metrics`] so the shared
+/// [`power_monitor::serialize::PROM_GAUGES`] catalog can read it. `Metrics` is
+/// `#[non_exhaustive]`, so it's built field-by-field from `Default` rather than
+/// a struct literal. Fields not carried over the wire (`all_power`,
+/// `interval_ms`) stay at their defaults — they aren't exported gauges.
+fn parsed_to_metrics(p: &ParsedSample) -> Metrics {
+    let mut m = Metrics::default();
+    m.sys_power = p.sys_power;
+    m.cpu_power = p.cpu_power;
+    m.gpu_power = p.gpu_power;
+    m.ane_power = p.ane_power;
+    m.dram_power = p.dram_power;
+    m.ecpu.utilization = p.ecpu_util;
+    m.ecpu.freq_mhz = p.ecpu_freq_mhz;
+    m.pcpu.utilization = p.pcpu_util;
+    m.pcpu.freq_mhz = p.pcpu_freq_mhz;
+    m.gpu_util = p.gpu_util;
+    m.gpu_freq_mhz = p.gpu_freq_mhz;
+    m.cpu_temp = p.cpu_temp_c;
+    m.gpu_temp = p.gpu_temp_c;
+    m.fan_rpm = p.fan_rpm;
+    m.fan_max_rpm = p.fan_max_rpm;
+    m.memory.used = p.memory_used_bytes;
+    m.memory.total = p.memory_total_bytes;
+    m.swap.used = p.swap_used_bytes;
+    m.swap.total = p.swap_total_bytes;
+    m
+}
+
 /// Render the full fleet state as Prometheus exposition text.
 ///
 /// A single scrape of `/metrics` on the collector replaces scraping every
@@ -656,173 +686,38 @@ fn fleet_to_prometheus(fleet: &[Mutex<HostState>]) -> String {
         })
         .collect();
 
-    let online: Vec<&Live> = snapshot.iter().filter(|l| l.parsed.is_some()).collect();
-
-    fn emit<F>(out: &mut String, online: &[&Live], name: &str, help: &str, f: F)
-    where
-        F: Fn(&ParsedSample) -> f64,
-    {
-        out.push_str("# HELP power_monitor_");
-        out.push_str(name);
-        out.push(' ');
-        out.push_str(help);
-        out.push_str("\n# TYPE power_monitor_");
-        out.push_str(name);
-        out.push_str(" gauge\n");
-        for h in online {
-            let Some(p) = h.parsed.as_ref() else {
-                continue;
-            };
-            // Skip emission until labels have populated; first poll may race.
+    // Render each labelled host's metrics once (ParsedSample → Metrics) so the
+    // shared PROM_GAUGES catalog drives both the single-host (`serve`) and fleet
+    // exporters from one source of truth. Hosts whose first poll hasn't yet
+    // populated chip/host labels are skipped (the label race the old per-gauge
+    // guard handled).
+    let rendered: Vec<(&str, &str, Metrics)> = snapshot
+        .iter()
+        .filter_map(|l| {
+            let p = l.parsed.as_ref()?;
             if p.chip.is_empty() || p.hostname.is_empty() {
-                continue;
+                return None;
             }
-            let v = f(p);
+            Some((p.chip.as_str(), p.hostname.as_str(), parsed_to_metrics(p)))
+        })
+        .collect();
+
+    for &(name, help, value) in power_monitor::serialize::PROM_GAUGES {
+        let _ = write!(
+            out,
+            "# HELP power_monitor_{name} {help}\n# TYPE power_monitor_{name} gauge\n"
+        );
+        for (chip, host, m) in &rendered {
+            let v = value(m);
             if v.is_nan() {
                 continue;
             }
-            // Direct write — no intermediate `format!` allocation.
             let _ = writeln!(
                 out,
-                "power_monitor_{name}{{chip=\"{}\",host=\"{}\"}} {v:.3}",
-                p.chip, p.hostname,
+                "power_monitor_{name}{{chip=\"{chip}\",host=\"{host}\"}} {v:.3}"
             );
         }
     }
-
-    emit(
-        &mut out,
-        &online,
-        "sys_power_watts",
-        "Total system power draw in watts",
-        |p| p.sys_power as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "cpu_power_watts",
-        "CPU power draw in watts",
-        |p| p.cpu_power as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "gpu_power_watts",
-        "GPU power draw in watts",
-        |p| p.gpu_power as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "ane_power_watts",
-        "Apple Neural Engine power draw in watts",
-        |p| p.ane_power as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "dram_power_watts",
-        "DRAM power draw in watts",
-        |p| p.dram_power as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "ecpu_utilization",
-        "Efficiency CPU cluster utilization (0-1)",
-        |p| p.ecpu_util as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "pcpu_utilization",
-        "Performance CPU cluster utilization (0-1)",
-        |p| p.pcpu_util as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "gpu_utilization",
-        "GPU utilization (0-1)",
-        |p| p.gpu_util as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "ecpu_freq_mhz",
-        "Efficiency CPU cluster weighted frequency in MHz",
-        |p| p.ecpu_freq_mhz as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "pcpu_freq_mhz",
-        "Performance CPU cluster weighted frequency in MHz",
-        |p| p.pcpu_freq_mhz as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "gpu_freq_mhz",
-        "GPU weighted frequency in MHz",
-        |p| p.gpu_freq_mhz as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "cpu_temp_celsius",
-        "CPU temperature in degrees Celsius",
-        |p| p.cpu_temp_c as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "gpu_temp_celsius",
-        "GPU temperature in degrees Celsius",
-        |p| p.gpu_temp_c as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "fan_rpm",
-        "Highest-duty fan current RPM (0 if fanless)",
-        |p| p.fan_rpm as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "fan_max_rpm",
-        "Highest-duty fan max RPM (0 if fanless)",
-        |p| p.fan_max_rpm as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "memory_used_bytes",
-        "Physical RAM used in bytes",
-        |p| p.memory_used_bytes as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "memory_total_bytes",
-        "Physical RAM total in bytes",
-        |p| p.memory_total_bytes as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "swap_used_bytes",
-        "Swap used in bytes",
-        |p| p.swap_used_bytes as f64,
-    );
-    emit(
-        &mut out,
-        &online,
-        "swap_total_bytes",
-        "Swap total in bytes",
-        |p| p.swap_total_bytes as f64,
-    );
 
     // Liveness: 1 if the agent responded within ~10 intervals, 0 otherwise.
     // Emitted for every configured target, including ones that have never

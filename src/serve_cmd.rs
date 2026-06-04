@@ -10,137 +10,23 @@ use crate::http::{
     MAX_INFLIGHT, extract_bearer, extract_path, http_response, read_request_head, try_acquire,
 };
 use crate::seqlock::SeqLock;
-use power_monitor::serialize::{AgentInfo, metrics_to_json, utc_now};
+use power_monitor::serialize::{AgentInfo, PROM_GAUGES, metrics_to_json, utc_now};
 
 // ── Prometheus format ─────────────────────────────────────────────────────────
 
-fn gauge_block(out: &mut String, name: &str, help: &str, chip: &str, host: &str, value: f64) {
-    let _ = write!(out, "# HELP {name} {help}\n# TYPE {name} gauge\n");
-    if !value.is_nan() {
-        let _ = writeln!(out, "{name}{{chip=\"{chip}\",host=\"{host}\"}} {value:.3}");
-    }
-}
-
 fn metrics_to_prometheus(m: &Metrics, chip: &str, host: &str) -> String {
-    // 17 gauges × ~80 bytes/line × ~3 lines/gauge ≈ 4 KiB. Preallocate.
+    // 19 gauges × ~80 bytes/line × ~3 lines/gauge ≈ 4 KiB. Preallocate.
     let mut out = String::with_capacity(4096);
-    let g = |out: &mut String, name, help, v| {
-        gauge_block(out, name, help, chip, host, v);
-    };
-    g(
-        &mut out,
-        "power_monitor_sys_power_watts",
-        "Total system power draw in watts",
-        m.sys_power as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_cpu_power_watts",
-        "CPU power draw in watts",
-        m.cpu_power as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_gpu_power_watts",
-        "GPU power draw in watts",
-        m.gpu_power as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_ane_power_watts",
-        "Apple Neural Engine power draw in watts",
-        m.ane_power as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_dram_power_watts",
-        "DRAM power draw in watts",
-        m.dram_power as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_ecpu_utilization",
-        "Efficiency CPU cluster utilization (0-1)",
-        m.ecpu.utilization as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_pcpu_utilization",
-        "Performance CPU cluster utilization (0-1)",
-        m.pcpu.utilization as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_gpu_utilization",
-        "GPU utilization (0-1)",
-        m.gpu_util as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_ecpu_freq_mhz",
-        "Efficiency CPU cluster weighted average frequency in MHz",
-        m.ecpu.freq_mhz as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_pcpu_freq_mhz",
-        "Performance CPU cluster weighted average frequency in MHz",
-        m.pcpu.freq_mhz as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_gpu_freq_mhz",
-        "GPU weighted average frequency in MHz",
-        m.gpu_freq_mhz as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_cpu_temp_celsius",
-        "CPU temperature in degrees Celsius",
-        m.cpu_temp as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_gpu_temp_celsius",
-        "GPU temperature in degrees Celsius",
-        m.gpu_temp as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_fan_rpm",
-        "Highest-duty fan current RPM (0 if fanless)",
-        m.fan_rpm as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_fan_max_rpm",
-        "Highest-duty fan max RPM (0 if fanless)",
-        m.fan_max_rpm as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_memory_used_bytes",
-        "Physical RAM used in bytes",
-        m.memory.used as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_memory_total_bytes",
-        "Physical RAM total in bytes",
-        m.memory.total as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_swap_used_bytes",
-        "Swap used in bytes",
-        m.swap.used as f64,
-    );
-    g(
-        &mut out,
-        "power_monitor_swap_total_bytes",
-        "Swap total in bytes",
-        m.swap.total as f64,
-    );
+    for &(name, help, value) in PROM_GAUGES {
+        let _ = write!(
+            out,
+            "# HELP power_monitor_{name} {help}\n# TYPE power_monitor_{name} gauge\n"
+        );
+        let v = value(m);
+        if !v.is_nan() {
+            let _ = writeln!(out, "power_monitor_{name}{{chip=\"{chip}\",host=\"{host}\"}} {v:.3}");
+        }
+    }
     out
 }
 

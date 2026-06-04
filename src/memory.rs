@@ -147,14 +147,14 @@ pub fn read_memory() -> Option<MemoryInfo> {
 
     // Activity Monitor formula (confirmed by macmon):
     // used = (active + inactive + wire + speculative + compressor - purgeable - external) × page
-    let used = (stats.active_count as u64
+    let used_pages = (stats.active_count as u64
         + stats.inactive_count as u64
         + stats.wire_count as u64
         + stats.speculative_count as u64
         + stats.compressor_page_count as u64)
         .saturating_sub(stats.purgeable_count as u64)
-        .saturating_sub(stats.external_page_count as u64)
-        * ps;
+        .saturating_sub(stats.external_page_count as u64);
+    let used = used_pages * ps;
 
     let available = stats.free_count as u64 * ps;
     let wired = stats.wire_count as u64 * ps;

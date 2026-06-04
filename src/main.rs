@@ -1,5 +1,6 @@
 mod args;
 mod collect_cmd;
+mod fan_cmd;
 mod http;
 mod pipe_cmd;
 mod seqlock;
@@ -79,6 +80,12 @@ const CYAN: &str = "\x1b[36m";
 
 const BAR_W: usize = 24;
 
+/// Inner box width — content columns between the `│` borders. Every row is
+/// padded to exactly this; a row whose visible width exceeds it overflows the
+/// right border. The temperature rows are the widest, so this must hold for a
+/// 3-digit (≥100 °C) reading, not just the common 2-digit case.
+const INNER: usize = 56;
+
 fn heat(frac: f32) -> &'static str {
     if frac < 0.40 {
         GREEN
@@ -113,7 +120,7 @@ fn left_col(label: &str, pct: f32) -> String {
 fn power_row(label: &str, watts: f32, max: f32) -> String {
     let pct = (watts / max * 100.0).clamp(0.0, 100.0);
     format!(
-        "{}{}  {CYAN}{watts:5.2}  W{RESET}",
+        "{}{}  {CYAN}{watts:5.2} W{RESET}",
         left_col(label, pct),
         bar(watts, max),
     )
@@ -124,7 +131,7 @@ fn power_row(label: &str, watts: f32, max: f32) -> String {
 fn power_row_temp(label: &str, watts: f32, max: f32, temp: f32, live: bool) -> String {
     let pct = (watts / max * 100.0).clamp(0.0, 100.0);
     format!(
-        "{}{}  {CYAN}{watts:5.2}  W{RESET}  {DIM}({RESET}{}{DIM}){RESET}",
+        "{}{}  {CYAN}{watts:5.2} W{RESET}  {DIM}({RESET}{}{DIM}){RESET}",
         left_col(label, pct),
         bar(watts, max),
         temp_str(temp, live),
@@ -285,6 +292,7 @@ fn print_usage() {
     eprintln!("  pipe            Stream JSON metrics to stdout (NDJSON)");
     eprintln!("  serve           Serve JSON + Prometheus metrics over HTTP");
     eprintln!("  collect         Aggregate many agents into one fleet dashboard");
+    eprintln!("  fan <max|auto>  Fan speed control (requires root)");
     eprintln!();
     eprintln!("Options for pipe:");
     eprintln!("  -s, --samples N   Stop after N samples (default: 0 = infinite)");
@@ -323,6 +331,10 @@ fn main() {
             collect_cmd::run(&args[1..]);
             return;
         }
+        Some("fan") => {
+            fan_cmd::run(&args[1..]);
+            return;
+        }
         Some("-h") | Some("--help") => {
             print_usage();
             return;
@@ -351,9 +363,6 @@ fn main() {
         let (gpu_disp, gpu_live) = display_temp(m.gpu_temp, &mut last_gpu_temp);
 
         write!(out, "{HOME}").ok();
-
-        // Inner width = content chars between │ and │.
-        const INNER: usize = 56;
 
         let soc = &sampler.soc;
         let pcpu = soc.pcpu_level().map_or(0, |l| l.cores);
@@ -474,5 +483,27 @@ mod tests {
     #[test]
     fn temp_str_nan_renders_dashes() {
         assert!(temp_str(f32::NAN, true).contains("--°C"));
+    }
+
+    #[test]
+    fn rows_never_exceed_box_width() {
+        // Every row must fit INNER so it can't overflow the right border.
+        // The temp rows are the widest; a 3-digit (≥100 °C) reading is the
+        // case that used to break the box.
+        for &t in &[46.0_f32, 100.0, 105.0, f32::NAN] {
+            for &live in &[true, false] {
+                let row = power_row_temp("GPU", 12.34, 16.0, t, live);
+                assert!(
+                    visual_len(&row) <= INNER,
+                    "temp row width {} > INNER {INNER} (temp={t}, live={live})",
+                    visual_len(&row),
+                );
+            }
+        }
+        // Plain power rows and the high-magnitude SYS row too.
+        assert!(visual_len(&power_row("SYS", 199.99, 40.0)) <= INNER);
+        assert!(visual_len(&util_row("PCPU", 1.0, 9999)) <= INNER);
+        assert!(visual_len(&mem_row("MEM", 99 << 30, 128 << 30)) <= INNER);
+        assert!(visual_len(&fan_row(6550, 6550)) <= INNER);
     }
 }

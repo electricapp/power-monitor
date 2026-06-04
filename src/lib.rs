@@ -90,6 +90,7 @@ type IOConnectT = u32;
 type MachPortT = u32;
 
 const KERNEL_INDEX_SMC: u32 = 2;
+const SMC_CMD_WRITE_BYTES: u8 = 6;
 const SMC_CMD_READ_BYTES: u8 = 5;
 const SMC_CMD_GET_KEY_FROM_INDEX: u8 = 8;
 const SMC_CMD_READ_KEYINFO: u8 = 9;
@@ -182,15 +183,30 @@ impl Decoder {
             Decoder::Ui32 => u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32,
         }
     }
+
+    fn encode(self, value: f32, bytes: &mut [u8; 32]) {
+        match self {
+            Decoder::Flt => bytes[..4].copy_from_slice(&value.to_le_bytes()),
+            Decoder::Sp78 => bytes[..2].copy_from_slice(&((value * 256.0) as i16).to_le_bytes()),
+            Decoder::Ioft => {
+                bytes[..4].copy_from_slice(&((value * 65536.0) as u32).to_le_bytes())
+            }
+            Decoder::Ui8 => bytes[0] = value as u8,
+            Decoder::Ui16 => bytes[..2].copy_from_slice(&(value as u16).to_be_bytes()),
+            Decoder::Si16 => bytes[..2].copy_from_slice(&(value as i16).to_be_bytes()),
+            Decoder::Ui32 => bytes[..4].copy_from_slice(&(value as u32).to_be_bytes()),
+        }
+    }
 }
 
 // ── Key table ─────────────────────────────────────────────────────────────────
 
-/// Pre-resolved SMC key: encoded four-cc, cached data size, decoder.
+/// Pre-resolved SMC key: encoded four-cc, cached data size/type, decoder.
 #[derive(Clone, Copy)]
 struct ResolvedKey {
     key: u32,
     data_size: u32,
+    data_type: u32,
     decoder: Decoder,
 }
 
@@ -298,6 +314,28 @@ impl std::fmt::Display for SmcError {
 }
 
 impl std::error::Error for SmcError {}
+
+/// Errors returned by [`Smc::write_f32`] and fan control methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SmcWriteError {
+    /// The SMC key does not exist on this hardware or uses an unsupported type.
+    KeyNotFound,
+    /// `IOConnectCallStructMethod` failed with the given `kern_return_t` code.
+    /// Common cause: writing without root privileges.
+    IoError(i32),
+}
+
+impl std::fmt::Display for SmcWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SmcWriteError::KeyNotFound => write!(f, "SMC key not found on this hardware"),
+            SmcWriteError::IoError(kr) => write!(f, "SMC write failed: kern_return_t {kr}"),
+        }
+    }
+}
+
+impl std::error::Error for SmcWriteError {}
 
 // ── Smc ───────────────────────────────────────────────────────────────────────
 
@@ -428,6 +466,52 @@ impl Smc {
         resolved.and_then(|rk| self.read_resolved(rk))
     }
 
+    /// Write a resolved key. One kernel call. Returns `Err(kern_return_t)` on failure.
+    fn write_resolved(&self, rk: ResolvedKey, value: f32) -> Result<(), i32> {
+        unsafe {
+            let mut req = mem::zeroed::<SmcKeyData>();
+            req.key = rk.key;
+            req.key_info.data_size = rk.data_size;
+            req.key_info.data_type = rk.data_type;
+            req.data8 = SMC_CMD_WRITE_BYTES;
+            rk.decoder.encode(value, &mut req.bytes);
+
+            let mut output = mem::MaybeUninit::<SmcKeyData>::uninit();
+            let mut output_size = mem::size_of::<SmcKeyData>();
+            let kr = IOConnectCallStructMethod(
+                self.conn,
+                KERNEL_INDEX_SMC,
+                &req,
+                mem::size_of::<SmcKeyData>(),
+                output.as_mut_ptr(),
+                &mut output_size,
+            );
+            if kr != 0 { Err(kr) } else { Ok(()) }
+        }
+    }
+
+    /// Write a value to an arbitrary SMC key by its four-CC code.
+    ///
+    /// The value is encoded according to the key's data type (discovered
+    /// automatically). Requires root privileges for most keys.
+    ///
+    /// Returns `Err` if the key is absent or the kernel rejects the write.
+    pub fn write_f32(&self, key: &[u8; 4], value: f32) -> Result<(), SmcWriteError> {
+        let key_u32 = four_cc(key);
+        if let Some(&entry) = self.cache.borrow().get(&key_u32) {
+            return match entry {
+                Some(rk) => self.write_resolved(rk, value).map_err(SmcWriteError::IoError),
+                None => Err(SmcWriteError::KeyNotFound),
+            };
+        }
+        let resolved = self.resolve_key(key);
+        self.cache.borrow_mut().insert(key_u32, resolved);
+        match resolved {
+            Some(rk) => self.write_resolved(rk, value).map_err(SmcWriteError::IoError),
+            None => Err(SmcWriteError::KeyNotFound),
+        }
+    }
+
     // ── Key enumeration ──────────────────────────────────────────────────────
 
     /// Total number of SMC keys on this machine (reads the `#KEY` meta-key).
@@ -472,6 +556,35 @@ impl Smc {
     pub fn all_keys(&self) -> Vec<[u8; 4]> {
         let count = self.key_count();
         (0..count).filter_map(|i| self.key_at_index(i)).collect()
+    }
+
+    /// Return raw key metadata: `(data_size, data_type_fourcc, data_attributes)`.
+    pub fn key_info(&self, key: &[u8; 4]) -> Option<(u32, [u8; 4], u8)> {
+        let key_u32 = four_cc(key);
+        unsafe {
+            let mut req = mem::zeroed::<SmcKeyData>();
+            req.key = key_u32;
+            req.data8 = SMC_CMD_READ_KEYINFO;
+
+            let mut output = mem::MaybeUninit::<SmcKeyData>::uninit();
+            let mut output_size = mem::size_of::<SmcKeyData>();
+            let kr = IOConnectCallStructMethod(
+                self.conn,
+                KERNEL_INDEX_SMC,
+                &req,
+                mem::size_of::<SmcKeyData>(),
+                output.as_mut_ptr(),
+                &mut output_size,
+            );
+            if kr != 0 {
+                return None;
+            }
+            let info = output.assume_init_ref().key_info;
+            if info.data_size == 0 {
+                return None;
+            }
+            Some((info.data_size, info.data_type.to_be_bytes(), info.data_attributes))
+        }
     }
 
     // ── Grouped reads ────────────────────────────────────────────────────────
@@ -612,6 +725,62 @@ impl Smc {
             .collect()
     }
 
+    // ── Fan control ─────────────────────────────────────────────────────────
+
+    /// Number of fans present (0–2). Zero on fanless hardware.
+    pub fn fan_count(&self) -> u8 {
+        let raw = self.read(K_FNUM);
+        if raw.is_finite() { raw.clamp(0.0, 2.0) as u8 } else { 0 }
+    }
+
+    /// Hardware maximum RPM for the given fan index (0 or 1).
+    pub fn fan_max_rpm(&self, fan: u8) -> f32 {
+        match fan {
+            0 => self.read(K_F0MX),
+            1 => self.read(K_F1MX),
+            _ => 0.0,
+        }
+    }
+
+    /// Force all fans to their hardware maximum RPM.
+    ///
+    /// Sets each fan to forced mode (`F0md`/`F1md` = 1) then writes the
+    /// max RPM as the target. **Requires root privileges.**
+    ///
+    /// On any failure mid-sequence, best-effort restores automatic control so
+    /// a fan is never left stranded in forced mode. (A `SIGKILL` or crash while
+    /// forced cannot be cleaned up from userspace — the fan holds its forced
+    /// state until the OS thermal manager reclaims it.)
+    pub fn set_fans_max(&self) -> Result<(), SmcWriteError> {
+        const MODE: [&[u8; 4]; 2] = [b"F0md", b"F1md"];
+        const TARGET: [&[u8; 4]; 2] = [b"F0Tg", b"F1Tg"];
+        let count = self.fan_count() as usize;
+        for i in 0..count {
+            let max_rpm = self.fan_max_rpm(i as u8);
+            if let Err(e) = self
+                .write_f32(MODE[i], 1.0)
+                .and_then(|()| self.write_f32(TARGET[i], max_rpm))
+            {
+                // Don't leave a half-forced fan behind on partial failure.
+                let _ = self.set_fans_auto();
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore all fans to automatic (OS-controlled) mode.
+    ///
+    /// Clears forced mode on each fan. **Requires root privileges.**
+    pub fn set_fans_auto(&self) -> Result<(), SmcWriteError> {
+        const MODE: [&[u8; 4]; 2] = [b"F0md", b"F1md"];
+        let count = self.fan_count() as usize;
+        for &mode in &MODE[..count] {
+            self.write_f32(mode, 0.0)?;
+        }
+        Ok(())
+    }
+
     // ── Internal ─────────────────────────────────────────────────────────────
 
     fn resolve_key(&self, key: &[u8; 4]) -> Option<ResolvedKey> {
@@ -654,6 +823,7 @@ impl Smc {
             Some(ResolvedKey {
                 key: key_u32,
                 data_size: info.data_size,
+                data_type: info.data_type,
                 decoder,
             })
         }

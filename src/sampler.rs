@@ -486,7 +486,6 @@ pub fn calc_utilization(states: &[StateResidency], freqs: &[u32]) -> (u32, f32) 
     let mut weighted: f64 = 0.0;
     let mut covered: u64 = 0;
     let mut active_idx: usize = 0;
-    let n_freqs = freqs.len();
 
     for s in states {
         total_ticks += s.ticks;
@@ -494,9 +493,9 @@ pub fn calc_utilization(states: &[StateResidency], freqs: &[u32]) -> (u32, f32) 
             continue;
         }
         active_ticks += s.ticks;
-        if active_idx < n_freqs {
-            // SAFETY: bounds checked by `active_idx < n_freqs`.
-            let f = unsafe { *freqs.get_unchecked(active_idx) };
+        // Active P-states beyond the freq table contribute to utilisation but
+        // not the weighted-frequency average (no MHz known for them).
+        if let Some(&f) = freqs.get(active_idx) {
             weighted += f64::from(f) * s.ticks as f64;
             covered += s.ticks;
         }

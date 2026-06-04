@@ -244,30 +244,25 @@ pub fn probe_voltage_state_properties() {
             }
             node_idx += 1;
 
-            let mut found_any = false;
             for prop_name in &candidates {
                 let data: Vec<u8> = read_iokit_data(service, prop_name);
-                if !data.is_empty() {
-                    let freqs = parse_voltage_states(&data);
-                    if !freqs.is_empty() {
-                        println!(
-                            "  node {node_idx}: {prop_name} ({} bytes, {} freqs): {:?}",
-                            data.len(),
-                            freqs.len(),
-                            &freqs
-                        );
-                        found_any = true;
-                    } else {
-                        println!(
-                            "  node {node_idx}: {prop_name} ({} bytes, could not parse as freq table)",
-                            data.len()
-                        );
-                        found_any = true;
-                    }
+                if data.is_empty() {
+                    continue;
                 }
-            }
-            if !found_any {
-                // Don't print anything for nodes with no voltage-states properties
+                let freqs = parse_voltage_states(&data);
+                if !freqs.is_empty() {
+                    println!(
+                        "  node {node_idx}: {prop_name} ({} bytes, {} freqs): {:?}",
+                        data.len(),
+                        freqs.len(),
+                        &freqs
+                    );
+                } else {
+                    println!(
+                        "  node {node_idx}: {prop_name} ({} bytes, could not parse as freq table)",
+                        data.len()
+                    );
+                }
             }
 
             IOObjectRelease(service);
