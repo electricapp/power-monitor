@@ -843,7 +843,9 @@ fn plist_path() -> Option<std::path::PathBuf> {
     )
 }
 
-fn do_install(hosts: &str, port: u16, interval_ms: u64, auth: Option<&str>) {
+fn do_install(hosts: &str, port: u16, interval_ms: u64, auth: crate::args::AuthArg) {
+    use crate::args::AuthArg;
+
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -867,9 +869,23 @@ fn do_install(hosts: &str, port: u16, interval_ms: u64, auth: Option<&str>) {
     push(&port.to_string());
     push("--interval");
     push(&interval_ms.to_string());
-    if let Some(tok) = auth {
-        push("--auth");
-        push(tok);
+    match auth {
+        AuthArg::None => {}
+        AuthArg::Inline(tok) => {
+            eprintln!(
+                "warning: storing the auth token in plaintext in the launchd plist; prefer --auth-file"
+            );
+            push("--auth");
+            push(tok);
+        }
+        AuthArg::File(path) => {
+            let abs = std::fs::canonicalize(path).unwrap_or_else(|e| {
+                eprintln!("error: --auth-file '{path}': {e}");
+                std::process::exit(1);
+            });
+            push("--auth-file");
+            push(&abs.to_string_lossy());
+        }
     }
 
     let plist = format!(
@@ -954,22 +970,60 @@ fn do_uninstall() {
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
-fn print_usage() {
-    eprintln!("Usage: power-monitor collect (--host <list> | --tailnet) [options]");
-    eprintln!("  --host LIST      Comma-separated agent targets (host[:port])");
-    eprintln!("  --tailnet        Auto-discover hosts via 'tailscale status'");
-    eprintln!("                   (mutually exclusive with --host)");
-    eprintln!("  -p, --port N     Dashboard HTTP listen port (default 8080)");
-    eprintln!("  -i, --interval N Poll interval in ms per agent (default 1000)");
-    eprintln!("      --auth TOK   Forward 'Authorization: Bearer TOK' to every agent");
-    eprintln!("      --install    Install and start as a launchd user agent");
-    eprintln!("      --uninstall  Stop and remove the launchd agent");
-    eprintln!();
-    eprintln!("Endpoints:");
-    eprintln!("  GET /          dashboard HTML");
-    eprintln!("  GET /stream    Server-Sent Events (fleet snapshot)");
-    eprintln!("  GET /snapshot  one-shot JSON snapshot");
-    eprintln!("  GET /metrics   aggregated Prometheus text (all hosts)");
+pub(crate) fn write_usage(w: &mut impl Write) {
+    let _ = writeln!(
+        w,
+        "Usage: power-monitor collect (--host <list> | --tailnet) [options]"
+    );
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Aggregate many 'serve' agents into one fleet dashboard.");
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Options:");
+    let _ = writeln!(
+        w,
+        "      --host LIST     Comma-separated agent targets (host[:port])"
+    );
+    let _ = writeln!(
+        w,
+        "      --tailnet       Auto-discover hosts via 'tailscale status'"
+    );
+    let _ = writeln!(w, "                      (mutually exclusive with --host)");
+    let _ = writeln!(
+        w,
+        "  -p, --port N        Dashboard HTTP listen port (default 8080)"
+    );
+    let _ = writeln!(
+        w,
+        "  -i, --interval N    Poll interval in ms per agent (default 1000)"
+    );
+    let _ = writeln!(
+        w,
+        "      --auth TOKEN    Forward 'Authorization: Bearer TOKEN' to every agent"
+    );
+    let _ = writeln!(
+        w,
+        "                      (insecure: visible in ps/shell history — prefer --auth-file)"
+    );
+    let _ = writeln!(
+        w,
+        "      --auth-file F   Read the bearer token from the first line of file F"
+    );
+    let _ = writeln!(
+        w,
+        "      --install       Install and start as a launchd user agent"
+    );
+    let _ = writeln!(w, "      --uninstall     Stop and remove the launchd agent");
+    let _ = writeln!(w, "  -h, --help          Show this help");
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Endpoints:");
+    let _ = writeln!(w, "  GET /          dashboard HTML");
+    let _ = writeln!(w, "  GET /stream    Server-Sent Events (fleet snapshot)");
+    let _ = writeln!(w, "  GET /snapshot  one-shot JSON snapshot");
+    let _ = writeln!(w, "  GET /metrics   aggregated Prometheus text (all hosts)");
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Examples:");
+    let _ = writeln!(w, "  power-monitor collect --host mac01,mac02,mac03");
+    let _ = writeln!(w, "  power-monitor collect --tailnet --port 8080 --install");
 }
 
 /// Entry point for `power-monitor collect`.
@@ -980,7 +1034,8 @@ pub fn run(args: &[String]) {
     let mut tailnet = false;
     let mut port: u16 = 8080;
     let mut interval_ms: u64 = 1000;
-    let mut auth: Option<String> = None;
+    let mut auth_token: Option<String> = None;
+    let mut auth_file: Option<String> = None;
     let mut install = false;
     let mut uninstall = false;
 
@@ -995,17 +1050,22 @@ pub fn run(args: &[String]) {
             "-i" | "--interval" => {
                 interval_ms = argp::parse_value(args, &mut i, "--interval", "interval")
             }
-            "--auth" => auth = Some(argp::take_value(args, &mut i, "--auth").to_string()),
+            "--auth" => auth_token = Some(argp::take_value(args, &mut i, "--auth").to_string()),
+            "--auth-file" => {
+                auth_file = Some(argp::take_value(args, &mut i, "--auth-file").to_string())
+            }
             "--install" => install = true,
             "--uninstall" => uninstall = true,
             "-h" | "--help" => {
-                print_usage();
+                write_usage(&mut std::io::stdout().lock());
                 return;
             }
             other => argp::unknown_arg(other),
         }
         i += 1;
     }
+
+    argp::check_auth_exclusive(&auth_token, &auth_file);
 
     if uninstall {
         do_uninstall();
@@ -1042,15 +1102,23 @@ pub fn run(args: &[String]) {
         Some(ref s) => s.clone(),
         None => {
             eprintln!("error: --host or --tailnet is required");
-            print_usage();
-            std::process::exit(1);
+            write_usage(&mut std::io::stderr().lock());
+            std::process::exit(2);
         }
     };
 
     if install {
-        do_install(&hosts_str, port, interval_ms, auth.as_deref());
+        let auth_arg = match (&auth_token, &auth_file) {
+            (Some(t), _) => argp::AuthArg::Inline(t),
+            (None, Some(p)) => argp::AuthArg::File(p),
+            (None, None) => argp::AuthArg::None,
+        };
+        do_install(&hosts_str, port, interval_ms, auth_arg);
         return;
     }
+
+    // Serving path: resolve the file token now (install passed the path through).
+    let auth = argp::resolve_auth(auth_token, auth_file);
 
     let targets = parse_hosts(&hosts_str, 9090);
     if targets.is_empty() {

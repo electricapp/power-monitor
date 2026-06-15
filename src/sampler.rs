@@ -262,7 +262,14 @@ impl Sampler {
             .unwrap_or((0, 0));
 
         acc.finish(
-            n, cpu_temp, gpu_temp, sys_power, mem, swap, fan_rpm, fan_max_rpm,
+            n,
+            cpu_temp,
+            gpu_temp,
+            sys_power,
+            mem,
+            swap,
+            fan_rpm,
+            fan_max_rpm,
         )
     }
 }

@@ -14,12 +14,12 @@ cask "power-monitor" do
   sha256 :no_check
 
   # TODO point at the signed GitHub release asset:
-  # url "https://github.com/YOUR-ORG/power-monitor/releases/download/v#{version}/PowerMonitorMenuBar-v#{version}-macos-arm64.zip"
+  # url "https://github.com/electricapp/power-monitor/releases/download/v#{version}/PowerMonitorMenuBar-v#{version}-macos-arm64.zip"
   url "about:blank"
 
   name "Power Monitor"
   desc "Apple Silicon power, performance, and thermal menu bar monitor"
-  # homepage "https://github.com/YOUR-ORG/power-monitor"
+  # homepage "https://github.com/electricapp/power-monitor"
 
   depends_on arch: :arm64
   depends_on macos: ">= :ventura"

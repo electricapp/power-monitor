@@ -230,7 +230,12 @@ power-monitor           # live TUI dashboard
 power-monitor pipe      # NDJSON metrics stream
 power-monitor serve     # HTTP + Prometheus endpoint
 power-monitor collect   # fleet dashboard
+power-monitor doctor    # health-check the SMC/IOReport subsystems
 ```
+
+`power-monitor --help` prints sectioned help; `power-monitor help <command>`
+(or `power-monitor <command> --help`) drills into any subcommand. `--version`
+is build-stamped (`0.1.0 (built <ts>, <git>)`).
 
 ### Menu bar app (unsigned build)
 
@@ -306,6 +311,45 @@ power-monitor serve --install
 
 # Remove the launchd agent
 power-monitor serve --uninstall
+```
+
+For an agent reachable over the network, keep the bearer token out of `ps`
+and shell history with `--auth-file` instead of `--auth`:
+
+```bash
+printf 'my-secret-token' > ~/.pm-token && chmod 600 ~/.pm-token
+power-monitor serve --bind 0.0.0.0 --auth-file ~/.pm-token --install
+```
+
+On `--install` the *path* (not the token) is written into the launchd plist.
+
+### doctor
+
+Health-check the monitoring subsystems — handy on a fresh machine or in CI.
+Exits non-zero if any critical check fails:
+
+```
+$ power-monitor doctor
+  ✓ CPU architecture   Apple Silicon (aarch64)
+  ✓ AppleSMC           opened; 1 fan(s), CPU 40°C / GPU 39°C
+  ✓ IOReport sampler   Apple M5 · 4P+6E · 10 GPU · sys 6.50 W
+```
+
+### Shell completions & man page
+
+Completions are generated on demand (no clap, no build step):
+
+```bash
+power-monitor completion bash > $(brew --prefix)/etc/bash_completion.d/power-monitor
+power-monitor completion zsh  > ~/.zsh/completions/_power-monitor
+power-monitor completion fish > ~/.config/fish/completions/power-monitor.fish
+```
+
+The man page is embedded in the binary:
+
+```bash
+power-monitor man | man -l -      # preview
+power-monitor man --install       # ~/.local/share/man/man1, then `man power-monitor`
 ```
 
 ## Licence

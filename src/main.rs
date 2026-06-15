@@ -1,13 +1,18 @@
 mod args;
 mod collect_cmd;
+mod completion_cmd;
+mod doctor_cmd;
 mod fan_cmd;
 mod http;
+mod man_cmd;
 mod pipe_cmd;
 mod seqlock;
 mod serve_cmd;
 
 use power_monitor::Sampler;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── time FFI (used for the bottom-bar clock) ─────────────────────────────────
 
@@ -29,6 +34,25 @@ struct LibcTm {
 unsafe extern "C" {
     fn time(tloc: *mut i64) -> i64;
     fn localtime_r(clock: *const i64, result: *mut LibcTm) -> *mut LibcTm;
+    // `handler` is a `void (*)(int)`, passed as a pointer-sized value so the
+    // same declaration can install a real handler or the special SIG_DFL (0).
+    fn signal(sig: i32, handler: usize) -> usize;
+    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+}
+
+const SIG_DFL: usize = 0;
+const SIGINT: i32 = 2;
+const SIGPIPE: i32 = 13;
+const SIGTERM: i32 = 15;
+
+/// Restore the default SIGPIPE action. Rust ignores SIGPIPE at startup, which
+/// turns a closed downstream pipe (`power-monitor pipe | head`) into an EPIPE
+/// that makes `print!` panic. Resetting to SIG_DFL makes the process exit
+/// quietly on a broken pipe, like a conventional Unix tool.
+fn reset_sigpipe() {
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
 }
 
 use power_monitor::serialize::hostname;
@@ -65,18 +89,93 @@ fn now_str() -> String {
 }
 
 // ── ANSI ─────────────────────────────────────────────────────────────────────
+//
+// Escape sequences are resolved at runtime, not baked in as `const`, so the
+// dashboard can honor the terminal it's actually running in. Two independent
+// capabilities gate them:
+//
+//   * `tty`   — gates cursor/screen *control* (hide cursor, clear, home, erase
+//               line). Off a TTY these are noise, so they collapse to "".
+//   * `color` — gates SGR *color* (bold/dim/colors). Honors NO_COLOR,
+//               TERM=dumb, --no-color, and the no-TTY case.
+//
+// Both default to full color (`COLOR`) before `init_palette`, so unit tests —
+// which never initialize the palette — measure the same visible widths.
 
-const HIDE_CURSOR: &str = "\x1b[?25l";
-const SHOW_CURSOR: &str = "\x1b[?25h";
-const HOME: &str = "\x1b[H";
-const ERASE_LINE: &str = "\x1b[2K";
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const GREEN: &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
-const RED: &str = "\x1b[31m";
-const CYAN: &str = "\x1b[36m";
+#[derive(Clone, Copy)]
+struct Palette {
+    hide_cursor: &'static str,
+    show_cursor: &'static str,
+    clear: &'static str,
+    home: &'static str,
+    erase_line: &'static str,
+    reset: &'static str,
+    bold: &'static str,
+    dim: &'static str,
+    green: &'static str,
+    yellow: &'static str,
+    red: &'static str,
+    cyan: &'static str,
+}
+
+const COLOR: Palette = Palette {
+    hide_cursor: "\x1b[?25l",
+    show_cursor: "\x1b[?25h",
+    clear: "\x1b[2J",
+    home: "\x1b[H",
+    erase_line: "\x1b[2K",
+    reset: "\x1b[0m",
+    bold: "\x1b[1m",
+    dim: "\x1b[2m",
+    green: "\x1b[32m",
+    yellow: "\x1b[33m",
+    red: "\x1b[31m",
+    cyan: "\x1b[36m",
+};
+
+static PALETTE: OnceLock<Palette> = OnceLock::new();
+static IS_TTY: AtomicBool = AtomicBool::new(false);
+
+/// The active palette. Falls back to full color before `init_palette` so any
+/// pre-init formatting (and the unit tests) still render visible escapes.
+fn pal() -> Palette {
+    *PALETTE.get().unwrap_or(&COLOR)
+}
+
+/// Decide whether color is allowed, following the conventional precedence:
+/// explicit `--no-color` < `NO_COLOR` < `TERM=dumb` < "is stdout a TTY".
+fn color_enabled(tty: bool, no_color_flag: bool) -> bool {
+    if no_color_flag {
+        return false;
+    }
+    if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    if std::env::var_os("TERM").is_some_and(|v| v == "dumb") {
+        return false;
+    }
+    tty
+}
+
+/// Install the process-wide palette once, from the resolved capabilities.
+fn init_palette(tty: bool, color: bool) {
+    IS_TTY.store(tty, Ordering::SeqCst);
+    let p = Palette {
+        hide_cursor: if tty { COLOR.hide_cursor } else { "" },
+        show_cursor: if tty { COLOR.show_cursor } else { "" },
+        clear: if tty { COLOR.clear } else { "" },
+        home: if tty { COLOR.home } else { "" },
+        erase_line: if tty { COLOR.erase_line } else { "" },
+        reset: if color { COLOR.reset } else { "" },
+        bold: if color { COLOR.bold } else { "" },
+        dim: if color { COLOR.dim } else { "" },
+        green: if color { COLOR.green } else { "" },
+        yellow: if color { COLOR.yellow } else { "" },
+        red: if color { COLOR.red } else { "" },
+        cyan: if color { COLOR.cyan } else { "" },
+    };
+    let _ = PALETTE.set(p);
+}
 
 const BAR_W: usize = 24;
 
@@ -87,21 +186,23 @@ const BAR_W: usize = 24;
 const INNER: usize = 56;
 
 fn heat(frac: f32) -> &'static str {
+    let p = pal();
     if frac < 0.40 {
-        GREEN
+        p.green
     } else if frac < 0.75 {
-        YELLOW
+        p.yellow
     } else {
-        RED
+        p.red
     }
 }
 
 fn bar(val: f32, max: f32) -> String {
+    let Palette { dim, reset, .. } = pal();
     let frac = (val / max).clamp(0.0, 1.0);
     let n = (frac * BAR_W as f32).round() as usize;
     // No gap between filled and empty — total is always exactly BAR_W chars.
     format!(
-        "{}{}{DIM}{}{RESET}",
+        "{}{}{dim}{}{reset}",
         heat(frac),
         "█".repeat(n),
         "░".repeat(BAR_W - n)
@@ -111,16 +212,20 @@ fn bar(val: f32, max: f32) -> String {
 /// Left column shared by every row: `  LABEL NN%  `.
 /// Fixed visual width so bars line up across sections.
 fn left_col(label: &str, pct: f32) -> String {
+    let Palette {
+        bold, dim, reset, ..
+    } = pal();
     format!(
-        "  {BOLD}{label:<5}{RESET} {DIM}{:3.0}%{RESET}  ",
+        "  {bold}{label:<5}{reset} {dim}{:3.0}%{reset}  ",
         pct.clamp(0.0, 100.0),
     )
 }
 
 fn power_row(label: &str, watts: f32, max: f32) -> String {
+    let Palette { cyan, reset, .. } = pal();
     let pct = (watts / max * 100.0).clamp(0.0, 100.0);
     format!(
-        "{}{}  {CYAN}{watts:5.2} W{RESET}",
+        "{}{}  {cyan}{watts:5.2} W{reset}",
         left_col(label, pct),
         bar(watts, max),
     )
@@ -129,9 +234,12 @@ fn power_row(label: &str, watts: f32, max: f32) -> String {
 /// Power row with a trailing temperature badge: `... 1.24  W  (46°C)`.
 /// `live=false` dims the badge to indicate a cached (rail-gated) reading.
 fn power_row_temp(label: &str, watts: f32, max: f32, temp: f32, live: bool) -> String {
+    let Palette {
+        cyan, dim, reset, ..
+    } = pal();
     let pct = (watts / max * 100.0).clamp(0.0, 100.0);
     format!(
-        "{}{}  {CYAN}{watts:5.2} W{RESET}  {DIM}({RESET}{}{DIM}){RESET}",
+        "{}{}  {cyan}{watts:5.2} W{reset}  {dim}({reset}{}{dim}){reset}",
         left_col(label, pct),
         bar(watts, max),
         temp_str(temp, live),
@@ -139,36 +247,47 @@ fn power_row_temp(label: &str, watts: f32, max: f32, temp: f32, live: bool) -> S
 }
 
 fn util_row(label: &str, util: f32, freq_mhz: u32) -> String {
+    let Palette { cyan, reset, .. } = pal();
     format!(
-        "{}{}  {CYAN}{freq_mhz:4} MHz{RESET}",
+        "{}{}  {cyan}{freq_mhz:4} MHz{reset}",
         left_col(label, util * 100.0),
         bar(util, 1.0),
     )
 }
 
 fn fan_row(rpm: u32, max_rpm: u32) -> String {
+    let Palette {
+        bold,
+        dim,
+        reset,
+        cyan,
+        ..
+    } = pal();
     if max_rpm == 0 {
         return format!(
-            "  {BOLD}FAN{RESET}    {DIM}—  {}  fanless{RESET}",
+            "  {bold}FAN{reset}    {dim}—  {}  fanless{reset}",
             "─".repeat(BAR_W),
         );
     }
     let duty = (rpm as f32 / max_rpm as f32).clamp(0.0, 1.0);
     format!(
-        "{}{}  {CYAN}{rpm:>4} RPM{RESET}",
+        "{}{}  {cyan}{rpm:>4} RPM{reset}",
         left_col("FAN", duty * 100.0),
         bar(duty, 1.0),
     )
 }
 
 fn mem_row(label: &str, used: u64, total: u64) -> String {
+    let Palette {
+        cyan, dim, reset, ..
+    } = pal();
     let pct = if total > 0 {
         used as f32 / total as f32
     } else {
         0.0
     };
     format!(
-        "{}{}  {CYAN}{}{RESET} {DIM}/ {} GB{RESET}",
+        "{}{}  {cyan}{}{reset} {dim}/ {} GB{reset}",
         left_col(label, pct * 100.0),
         bar(pct, 1.0),
         fmt_gb(used),
@@ -177,20 +296,28 @@ fn mem_row(label: &str, used: u64, total: u64) -> String {
 }
 
 fn temp_str(t: f32, live: bool) -> String {
+    let Palette {
+        dim,
+        reset,
+        green,
+        yellow,
+        red,
+        ..
+    } = pal();
     if t.is_nan() {
-        return format!("{DIM}--°C{RESET}");
+        return format!("{dim}--°C{reset}");
     }
     if !live {
-        return format!("{DIM}{t:.0}°C{RESET}");
+        return format!("{dim}{t:.0}°C{reset}");
     }
     let color = if t < 70.0 {
-        GREEN
+        green
     } else if t < 85.0 {
-        YELLOW
+        yellow
     } else {
-        RED
+        red
     };
-    format!("{color}{t:.0}°C{RESET}")
+    format!("{color}{t:.0}°C{reset}")
 }
 
 /// Returns `(display_temp, live)`. When `current` is NaN, falls back to the
@@ -238,11 +365,17 @@ fn visual_len(s: &str) -> usize {
 
 /// Write one box line: `│ {content}{padding} │\n`, clearing any old content first.
 fn box_row(out: &mut impl Write, content: &str, inner: usize) {
+    let Palette {
+        erase_line,
+        dim,
+        reset,
+        ..
+    } = pal();
     let vlen = visual_len(content);
     let pad = inner.saturating_sub(vlen);
     writeln!(
         out,
-        "{ERASE_LINE}{DIM}│{RESET}{content}{}{DIM}│{RESET}",
+        "{erase_line}{dim}│{reset}{content}{}{dim}│{reset}",
         " ".repeat(pad)
     )
     .ok();
@@ -250,9 +383,15 @@ fn box_row(out: &mut impl Write, content: &str, inner: usize) {
 
 /// Write an empty box line (blank row inside the border).
 fn box_empty(out: &mut impl Write, inner: usize) {
+    let Palette {
+        erase_line,
+        dim,
+        reset,
+        ..
+    } = pal();
     writeln!(
         out,
-        "{ERASE_LINE}{DIM}│{RESET}{}{DIM}│{RESET}",
+        "{erase_line}{dim}│{reset}{}{dim}│{reset}",
         " ".repeat(inner)
     )
     .ok();
@@ -260,7 +399,13 @@ fn box_empty(out: &mut impl Write, inner: usize) {
 
 /// Write a full-width horizontal rule inside the box: `│──────│`.
 fn box_rule(out: &mut impl Write, inner: usize) {
-    writeln!(out, "{ERASE_LINE}{DIM}│{}│{RESET}", "─".repeat(inner)).ok();
+    let Palette {
+        erase_line,
+        dim,
+        reset,
+        ..
+    } = pal();
+    writeln!(out, "{erase_line}{dim}│{}│{reset}", "─".repeat(inner)).ok();
 }
 
 // ── Cursor guard ──────────────────────────────────────────────────────────────
@@ -269,7 +414,8 @@ struct Screen;
 
 impl Screen {
     fn open() -> Self {
-        print!("{HIDE_CURSOR}\x1b[2J{HOME}");
+        let p = pal();
+        print!("{}{}{}", p.hide_cursor, p.clear, p.home);
         std::io::stdout().flush().ok();
         Screen
     }
@@ -277,92 +423,335 @@ impl Screen {
 
 impl Drop for Screen {
     fn drop(&mut self) {
-        println!("{SHOW_CURSOR}{RESET}");
+        let p = pal();
+        println!("{}{}", p.show_cursor, p.reset);
         std::io::stdout().flush().ok();
+    }
+}
+
+// ── Signals ────────────────────────────────────────────────────────────────────
+
+/// Cleared by SIGINT/SIGTERM so the render loop can exit and let `Screen`'s
+/// `Drop` restore the terminal — a default-handled signal would kill the
+/// process mid-loop and leave the cursor hidden.
+static RUNNING: AtomicBool = AtomicBool::new(true);
+
+extern "C" fn handle_signal(_sig: i32) {
+    // Restoring the cursor here is async-signal-safe (a raw `write` syscall),
+    // so the terminal is usable the instant Ctrl-C lands — even though the
+    // process takes up to one sample window to actually unwind and exit.
+    if IS_TTY.load(Ordering::SeqCst) {
+        const SHOW: &[u8] = b"\x1b[?25h\x1b[0m";
+        unsafe {
+            write(1, SHOW.as_ptr(), SHOW.len());
+        }
+    }
+    RUNNING.store(false, Ordering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    unsafe {
+        signal(SIGINT, handle_signal as *const () as usize); // Ctrl-C
+        signal(SIGTERM, handle_signal as *const () as usize);
     }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
-fn print_usage() {
-    eprintln!("Usage: power-monitor [COMMAND]");
-    eprintln!();
-    eprintln!("Commands:");
-    eprintln!("  (none)          Live TUI dashboard");
-    eprintln!("  pipe            Stream JSON metrics to stdout (NDJSON)");
-    eprintln!("  serve           Serve JSON + Prometheus metrics over HTTP");
-    eprintln!("  collect         Aggregate many agents into one fleet dashboard");
-    eprintln!("  fan <max|auto>  Fan speed control (requires root)");
-    eprintln!();
-    eprintln!("Options for pipe:");
-    eprintln!("  -s, --samples N   Stop after N samples (default: 0 = infinite)");
-    eprintln!("  -i, --interval N  Sampling window in ms (default: 1000)");
-    eprintln!();
-    eprintln!("Options for serve:");
-    eprintln!("      --bind ADDR   Bind address (default: 127.0.0.1)");
-    eprintln!("  -p, --port N      Listen port (default: 9090)");
-    eprintln!("  -i, --interval N  Sampling interval in ms (default: 1000)");
-    eprintln!("      --auth TOKEN  Require 'Authorization: Bearer TOKEN' on all requests");
-    eprintln!("      --install     Install as a launchd user agent and start");
-    eprintln!("      --uninstall   Stop and remove the launchd agent");
-    eprintln!();
-    eprintln!("Options for collect:");
-    eprintln!("      --host LIST   Comma-separated list of agents (host[:port])");
-    eprintln!("  -p, --port N      Dashboard listen port (default: 8080)");
-    eprintln!("  -i, --interval N  Per-agent poll interval in ms (default: 1000)");
-    eprintln!("      --auth TOKEN  Forward 'Authorization: Bearer TOKEN' to every agent");
-    eprintln!("      --install     Install as a launchd user agent and start");
-    eprintln!("      --uninstall   Stop and remove the launchd agent");
+/// `0.1.0 (built <ts>, <git>)` — the build-stamped version detail. `PM_GIT`
+/// and `PM_BUILD_TIME` are injected by `build.rs`.
+fn version_detail() -> String {
+    format!(
+        "{} (built {}, {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("PM_BUILD_TIME"),
+        env!("PM_GIT"),
+    )
+}
+
+/// Top-level help, in the phonon section layout: NAME / USAGE / DESCRIPTION /
+/// COMMANDS / GLOBAL OPTIONS / EXAMPLES / LEARN MORE / SUPPORT / COPYRIGHT.
+fn write_usage(w: &mut impl Write) {
+    let _ = writeln!(w, "NAME:");
+    let _ = writeln!(
+        w,
+        "   power-monitor - command line for Apple Silicon power & performance monitoring"
+    );
+    let _ = writeln!(w, "   version {}", version_detail());
+    let _ = writeln!(w);
+    let _ = writeln!(w, "USAGE:");
+    let _ = writeln!(w, "   power-monitor [OPTIONS] [COMMAND]");
+    let _ = writeln!(w);
+    let _ = writeln!(w, "DESCRIPTION:");
+    let _ = writeln!(
+        w,
+        "   power-monitor reads power, temperature, fan RPM, CPU/GPU utilisation,"
+    );
+    let _ = writeln!(
+        w,
+        "   frequency, voltage, current, battery, and RAM/swap on Apple Silicon by"
+    );
+    let _ = writeln!(
+        w,
+        "   talking directly to AppleSMC, IOReport, and IOKit over FFI — no"
+    );
+    let _ = writeln!(w, "   subprocesses and no sudo for reads.");
+    let _ = writeln!(w);
+    let _ = writeln!(
+        w,
+        "   With no command it renders a live terminal dashboard."
+    );
+    let _ = writeln!(w);
+    let _ = writeln!(w, "COMMANDS:");
+    let _ = writeln!(w, "  pipe          Stream metrics to stdout as NDJSON");
+    let _ = writeln!(
+        w,
+        "  serve         Serve JSON + Prometheus metrics over HTTP"
+    );
+    let _ = writeln!(
+        w,
+        "  collect       Aggregate many agents into one fleet dashboard"
+    );
+    let _ = writeln!(
+        w,
+        "  fan           Control fan speed: max | auto (requires root)"
+    );
+    let _ = writeln!(
+        w,
+        "  doctor        Run health checks on the monitoring subsystems"
+    );
+    let _ = writeln!(w, "  man           Print or install the man page");
+    let _ = writeln!(
+        w,
+        "  completion    Generate shell completions (bash | zsh | fish)"
+    );
+    let _ = writeln!(
+        w,
+        "  help          Print this message or the help of the given subcommand(s)"
+    );
+    let _ = writeln!(w);
+    let _ = writeln!(w, "GLOBAL OPTIONS:");
+    let _ = writeln!(w, "      --no-color   Disable ANSI colors [env: NO_COLOR=]");
+    let _ = writeln!(w, "  -h, --help       Print help");
+    let _ = writeln!(w, "  -V, --version    Print version");
+    let _ = writeln!(w);
+    let _ = writeln!(w, "EXAMPLES:");
+    let _ = writeln!(
+        w,
+        "   $ power-monitor                       # live dashboard"
+    );
+    let _ = writeln!(
+        w,
+        "   $ power-monitor pipe | jq             # stream NDJSON metrics"
+    );
+    let _ = writeln!(
+        w,
+        "   $ power-monitor pipe -s 10 -i 500     # 10 samples, 500 ms apart"
+    );
+    let _ = writeln!(
+        w,
+        "   $ power-monitor serve --bind 0.0.0.0  # HTTP + Prometheus exporter"
+    );
+    let _ = writeln!(
+        w,
+        "   $ power-monitor collect --tailnet     # fleet view across a tailnet"
+    );
+    let _ = writeln!(
+        w,
+        "   $ sudo power-monitor fan max          # pin fans to full"
+    );
+    let _ = writeln!(w);
+    let _ = writeln!(w, "LEARN MORE:");
+    let _ = writeln!(
+        w,
+        "   Use `power-monitor <command> --help` for details on any command."
+    );
+    let _ = writeln!(
+        w,
+        "   Run `power-monitor doctor` to verify subsystem access."
+    );
+    let _ = writeln!(
+        w,
+        "   Read the full docs at https://github.com/electricapp/power-monitor"
+    );
+    let _ = writeln!(w);
+    let _ = writeln!(w, "SUPPORT:");
+    let _ = writeln!(
+        w,
+        "   Report bugs at https://github.com/electricapp/power-monitor/issues"
+    );
+    let _ = writeln!(w);
+    let _ = writeln!(w, "COPYRIGHT:");
+    let _ = writeln!(w, "   (c) 2026 electricapp. Licensed MIT or Apache-2.0.");
+}
+
+/// Route `--help` / `help [command]` to the right usage text, on **stdout**.
+fn print_help_for(sub: Option<&str>) {
+    let mut out = std::io::stdout().lock();
+    match sub {
+        Some("pipe") => pipe_cmd::write_usage(&mut out),
+        Some("serve") => serve_cmd::write_usage(&mut out),
+        Some("collect") => collect_cmd::write_usage(&mut out),
+        Some("fan") => fan_cmd::write_usage(&mut out),
+        Some("doctor") => doctor_cmd::write_usage(&mut out),
+        Some("man") => man_cmd::write_usage(&mut out),
+        Some("completion") => completion_cmd::write_usage(&mut out),
+        Some(other) => {
+            let _ = writeln!(out, "No help topic for '{other}'.\n");
+            write_usage(&mut out);
+        }
+        None => write_usage(&mut out),
+    }
+}
+
+/// Levenshtein edit distance, for "did you mean" command suggestions.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Nearest known command within edit distance 2, if any.
+fn suggest_command(input: &str) -> Option<&'static str> {
+    const CMDS: [&str; 9] = [
+        "pipe",
+        "serve",
+        "collect",
+        "fan",
+        "doctor",
+        "man",
+        "completion",
+        "help",
+        "version",
+    ];
+    CMDS.iter()
+        .copied()
+        .map(|c| (c, levenshtein(input, c)))
+        .filter(|&(_, d)| d <= 2)
+        .min_by_key(|&(_, d)| d)
+        .map(|(c, _)| c)
 }
 
 fn main() {
+    // Behave like a normal Unix tool when a downstream pipe closes early.
+    reset_sigpipe();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     match args.first().map(String::as_str) {
-        Some("pipe") => {
-            pipe_cmd::run(&args[1..]);
+        Some("pipe") => return pipe_cmd::run(&args[1..]),
+        Some("serve") => return serve_cmd::run(&args[1..]),
+        Some("collect") => return collect_cmd::run(&args[1..]),
+        Some("fan") => return fan_cmd::run(&args[1..]),
+        Some("doctor") => return doctor_cmd::run(&args[1..]),
+        Some("man") => return man_cmd::run(&args[1..]),
+        Some("completion") => return completion_cmd::run(&args[1..]),
+        Some("help") | Some("-h") | Some("--help") => {
+            // `help <command>` shows that command's help; otherwise top-level.
+            let sub = if args[0] == "help" {
+                args.get(1).map(String::as_str)
+            } else {
+                None
+            };
+            print_help_for(sub);
             return;
         }
-        Some("serve") => {
-            serve_cmd::run(&args[1..]);
+        Some("-V") | Some("--version") => {
+            println!("power-monitor {}", version_detail());
             return;
         }
-        Some("collect") => {
-            collect_cmd::run(&args[1..]);
-            return;
-        }
-        Some("fan") => {
-            fan_cmd::run(&args[1..]);
-            return;
-        }
-        Some("-h") | Some("--help") => {
-            print_usage();
-            return;
-        }
+        // A leading-dash token that isn't a known global flag — fall through
+        // to the dashboard's own option parsing (it accepts --no-color).
+        Some(s) if s.starts_with('-') => {}
         Some(unknown) => {
-            eprintln!("Unknown command: {unknown}");
-            print_usage();
-            std::process::exit(1);
+            eprintln!("error: unknown command: {unknown}");
+            if let Some(sug) = suggest_command(unknown) {
+                eprintln!("did you mean '{sug}'?");
+            }
+            eprintln!();
+            write_usage(&mut std::io::stderr().lock());
+            std::process::exit(2);
         }
         None => {} // fall through to TUI
     }
 
-    let mut sampler = Sampler::new().expect("failed to open Sampler");
+    // ── Bare dashboard: parse the handful of options it accepts. ──
+    let mut no_color = false;
+    for a in &args {
+        match a.as_str() {
+            "--no-color" => no_color = true,
+            other => {
+                eprintln!("error: unknown option for the dashboard: {other}");
+                eprintln!("run 'power-monitor --help' for usage");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let tty = std::io::stdout().is_terminal();
+    init_palette(tty, color_enabled(tty, no_color));
+    if !tty {
+        eprintln!(
+            "note: the live dashboard is meant for a terminal; for scripts use 'power-monitor pipe'"
+        );
+    }
+    // Restore the cursor and exit cleanly on Ctrl-C / SIGTERM.
+    install_signal_handlers();
+
+    let mut sampler = Sampler::new().unwrap_or_else(|| {
+        eprintln!("error: failed to open Sampler (power-monitoring subsystems)");
+        std::process::exit(1);
+    });
     let _screen = Screen::open();
     let mut out = std::io::stdout().lock();
     let host = hostname();
     let version = env!("CARGO_PKG_VERSION");
+
+    // Draw an immediate placeholder so the screen isn't blank for the first
+    // sample window (~1s). The first real frame overwrites it from HOME.
+    {
+        let p = pal();
+        write!(
+            out,
+            "{}{}collecting first sample…{}",
+            p.home, p.dim, p.reset
+        )
+        .ok();
+        out.flush().ok();
+    }
     // Cached last-known temps so the badge holds a stale (dim) value
     // through rail-gated windows instead of blanking.
     let mut last_cpu_temp = f32::NAN;
     let mut last_gpu_temp = f32::NAN;
 
-    loop {
+    while RUNNING.load(Ordering::Relaxed) {
         let m = sampler.get_metrics(1000);
+        // A signal may have arrived during the sample window; if so, break
+        // before drawing so `Screen`'s Drop restores the terminal cleanly.
+        if !RUNNING.load(Ordering::Relaxed) {
+            break;
+        }
         let (cpu_disp, cpu_live) = display_temp(m.cpu_temp, &mut last_cpu_temp);
         let (gpu_disp, gpu_live) = display_temp(m.gpu_temp, &mut last_gpu_temp);
 
-        write!(out, "{HOME}").ok();
+        let Palette {
+            home,
+            erase_line,
+            bold,
+            dim,
+            reset,
+            ..
+        } = pal();
+        write!(out, "{home}").ok();
 
         let soc = &sampler.soc;
         let pcpu = soc.pcpu_level().map_or(0, |l| l.cores);
@@ -386,7 +775,7 @@ fn main() {
         let pad = (INNER + 2).saturating_sub(t_len + 3);
         writeln!(
             out,
-            "{ERASE_LINE}{DIM}╭─{RESET}{BOLD}{title}{RESET}{DIM}{pad}╮{RESET}",
+            "{erase_line}{dim}╭─{reset}{bold}{title}{reset}{dim}{pad}╮{reset}",
             pad = "─".repeat(pad)
         )
         .ok();
@@ -447,7 +836,7 @@ fn main() {
         let pad = (INNER + 2).saturating_sub(sys_str.len() + interval_str.len() + 2);
         writeln!(
             out,
-            "{ERASE_LINE}{DIM}╰{sys_str}{pad}{interval_str}╯{RESET}",
+            "{erase_line}{dim}╰{sys_str}{pad}{interval_str}╯{reset}",
             pad = "─".repeat(pad),
         )
         .ok();

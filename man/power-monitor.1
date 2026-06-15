@@ -1,0 +1,176 @@
+.\" Manpage for power-monitor.
+.\" Regenerate the web/terminal docs from README.md; keep this in sync by hand.
+.TH POWER-MONITOR 1 "2026-06-09" "power-monitor" "User Commands"
+.SH NAME
+power-monitor \- Apple Silicon power and performance monitor
+.SH SYNOPSIS
+.B power-monitor
+.RI [ COMMAND ]
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B power-monitor
+reads power, temperature, fan RPM, CPU/GPU utilisation and frequency, voltage,
+current, battery state, and RAM/swap on Apple Silicon Macs by talking directly
+to AppleSMC, libIOReport, and IOKit over FFI. It spawns no subprocesses and
+needs no elevated privileges for reading (writing fan state requires root).
+.PP
+With no command it renders a live terminal dashboard. Color and cursor control
+are emitted only when standard output is a terminal.
+.SH COMMANDS
+.TP
+.B (none)
+Live TUI dashboard. Exits cleanly on
+.B Ctrl-C
+or
+.BR SIGTERM ,
+restoring the cursor.
+.TP
+.B pipe
+Stream one JSON object per sample window to standard output (NDJSON).
+.TP
+.B serve
+Serve a JSON snapshot and Prometheus metrics over HTTP.
+.TP
+.B collect
+Aggregate many
+.B serve
+agents into one fleet dashboard.
+.TP
+.BI "fan " <max|auto>
+Force fans to maximum or restore automatic control. Requires root.
+.TP
+.B doctor
+Run health checks on the monitoring subsystems and print a checklist.
+.TP
+.B man
+Print the man page to standard output, or
+.B "man --install"
+to install it.
+.TP
+.BI "completion " <bash|zsh|fish>
+Print a shell completion script to standard output.
+.TP
+.BI "help " [COMMAND]
+Show help, optionally for a single command.
+.SH GLOBAL OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Show help on standard output and exit 0.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.TP
+.B \-\-no\-color
+Disable color in the dashboard. See also
+.BR NO_COLOR .
+.SH "PIPE OPTIONS"
+.TP
+.BR \-s ", " \-\-samples " " \fIN\fR
+Stop after N samples (default 0 = infinite).
+.TP
+.BR \-i ", " \-\-interval " " \fIN\fR
+Sampling window in milliseconds (default 1000).
+.SH "SERVE OPTIONS"
+.TP
+.BI \-\-bind " ADDR"
+Bind address (default 127.0.0.1; use 0.0.0.0 for LAN).
+.TP
+.BR \-p ", " \-\-port " " \fIN\fR
+Listen port (default 9090).
+.TP
+.BR \-i ", " \-\-interval " " \fIN\fR
+Sampling interval in milliseconds (default 1000).
+.TP
+.BI \-\-auth " TOKEN"
+Require an
+.B Authorization: Bearer TOKEN
+header on every request. Insecure: the token is visible in
+.BR ps (1)
+output and shell history. Prefer
+.BR \-\-auth\-file .
+.TP
+.BI \-\-auth\-file " PATH"
+Read the bearer token from the first line of PATH. On
+.B \-\-install
+the path (not the token) is written to the launchd plist.
+.TP
+.BR \-\-install ", " \-\-uninstall
+Install/remove a launchd user agent that runs the server at login.
+.SH "COLLECT OPTIONS"
+.TP
+.BI \-\-host " LIST"
+Comma-separated agent targets (host[:port]).
+.TP
+.B \-\-tailnet
+Auto-discover online peers via
+.BR "tailscale status" .
+Mutually exclusive with
+.BR \-\-host .
+.TP
+.BR \-p ", " \-\-port " " \fIN\fR
+Dashboard HTTP listen port (default 8080).
+.TP
+.BR \-i ", " \-\-interval " " \fIN\fR
+Per-agent poll interval in milliseconds (default 1000).
+.TP
+.BI \-\-auth " TOKEN" ", " \-\-auth\-file " PATH"
+Bearer token forwarded to every agent and enforced on the dashboard. See the
+serve options for the security note.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+If set to a non-empty value, disables color (https://no-color.org).
+.TP
+.B TERM
+If
+.BR dumb ,
+color is disabled.
+.SH "EXIT STATUS"
+.TP
+.B 0
+Success, or help/version requested.
+.TP
+.B 1
+Runtime failure (e.g. could not open a subsystem or bind a port).
+.TP
+.B 2
+Usage error (unknown command/flag, missing or invalid value).
+.SH EXAMPLES
+.PP
+Live dashboard:
+.PP
+.RS
+.EX
+power-monitor
+.EE
+.RE
+.PP
+Stream metrics as NDJSON and pretty-print:
+.PP
+.RS
+.EX
+power-monitor pipe | jq
+.EE
+.RE
+.PP
+HTTP exporter with a file-based token, installed at login:
+.PP
+.RS
+.EX
+power-monitor serve --bind 0.0.0.0 --auth-file ~/.pm-token --install
+.EE
+.RE
+.PP
+Fleet view across a tailnet:
+.PP
+.RS
+.EX
+power-monitor collect --tailnet --port 8080 --install
+.EE
+.RE
+.SH "SEE ALSO"
+.BR jq (1),
+.BR launchctl (1),
+.BR tailscale (1)
+.PP
+Full documentation and issues: https://github.com/electricapp/power-monitor

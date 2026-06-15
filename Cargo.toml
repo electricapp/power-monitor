@@ -8,12 +8,9 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["power", "monitoring", "macos", "apple-silicon", "performance"]
 categories = ["os", "hardware-support"]
-# docs.rs URL is deterministic from the crate name — safe to ship even before
-# the repo is public. `repository` / `homepage` get filled in at publish time.
 documentation = "https://docs.rs/power-monitor"
-# TODO set `repository` and `homepage` to the public repo URL before first publish.
-# repository = "https://github.com/YOUR-ORG/power-monitor"
-# homepage = "https://github.com/YOUR-ORG/power-monitor"
+repository = "https://github.com/electricapp/power-monitor"
+homepage = "https://github.com/electricapp/power-monitor"
 
 # Keep the published tarball minimal — no Swift menu bar app, no build output,
 # no generated PNGs. Crate consumers only need Rust sources + headers.

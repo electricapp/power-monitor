@@ -24,7 +24,10 @@ fn metrics_to_prometheus(m: &Metrics, chip: &str, host: &str) -> String {
         );
         let v = value(m);
         if !v.is_nan() {
-            let _ = writeln!(out, "power_monitor_{name}{{chip=\"{chip}\",host=\"{host}\"}} {v:.3}");
+            let _ = writeln!(
+                out,
+                "power_monitor_{name}{{chip=\"{chip}\",host=\"{host}\"}} {v:.3}"
+            );
         }
     }
     out
@@ -37,7 +40,9 @@ fn plist_path() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(home).join("Library/LaunchAgents/com.power-monitor.plist"))
 }
 
-fn do_install(bind: &str, port: u16, interval_ms: u64, auth: Option<&str>) {
+fn do_install(bind: &str, port: u16, interval_ms: u64, auth: crate::args::AuthArg) {
+    use crate::args::AuthArg;
+
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -61,9 +66,27 @@ fn do_install(bind: &str, port: u16, interval_ms: u64, auth: Option<&str>) {
     push(&port.to_string());
     push("--interval");
     push(&interval_ms.to_string());
-    if let Some(tok) = auth {
-        push("--auth");
-        push(tok);
+    match auth {
+        AuthArg::None => {}
+        // An inline token has to be written into the plist in plaintext —
+        // warn, and steer the user toward --auth-file.
+        AuthArg::Inline(tok) => {
+            eprintln!(
+                "warning: storing the auth token in plaintext in the launchd plist; prefer --auth-file"
+            );
+            push("--auth");
+            push(tok);
+        }
+        // For a file, persist the *path* (absolute, so launchd can find it)
+        // rather than the secret itself.
+        AuthArg::File(path) => {
+            let abs = std::fs::canonicalize(path).unwrap_or_else(|e| {
+                eprintln!("error: --auth-file '{path}': {e}");
+                std::process::exit(1);
+            });
+            push("--auth-file");
+            push(&abs.to_string_lossy());
+        }
     }
 
     let plist = format!(
@@ -148,16 +171,56 @@ fn do_uninstall() {
 
 // ── serve subcommand ──────────────────────────────────────────────────────────
 
-fn print_usage() {
-    eprintln!(
-        "Usage: power-monitor serve [--bind <addr>] [-p <port>] [-i <interval_ms>] [--auth <token>] [--install] [--uninstall]"
+pub(crate) fn write_usage(w: &mut impl Write) {
+    let _ = writeln!(
+        w,
+        "Usage: power-monitor serve [--bind <addr>] [-p <port>] [-i <ms>]"
     );
-    eprintln!("  --bind           Bind address (default 127.0.0.1; use 0.0.0.0 for LAN)");
-    eprintln!("  -p, --port       Listen port (default 9090)");
-    eprintln!("  -i, --interval   Sampling interval ms (default 1000)");
-    eprintln!("  --auth <token>   Require 'Authorization: Bearer <token>' on every request");
-    eprintln!("  --install        Install and start as a launchd user agent");
-    eprintln!("  --uninstall      Stop and remove the launchd agent");
+    let _ = writeln!(
+        w,
+        "                           [--auth <token> | --auth-file <path>] [--install | --uninstall]"
+    );
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Serve a JSON snapshot and Prometheus metrics over HTTP.");
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Options:");
+    let _ = writeln!(
+        w,
+        "      --bind ADDR    Bind address (default 127.0.0.1; 0.0.0.0 for LAN)"
+    );
+    let _ = writeln!(w, "  -p, --port N       Listen port (default 9090)");
+    let _ = writeln!(
+        w,
+        "  -i, --interval N   Sampling interval in ms (default 1000)"
+    );
+    let _ = writeln!(
+        w,
+        "      --auth TOKEN   Require 'Authorization: Bearer TOKEN' on every request"
+    );
+    let _ = writeln!(
+        w,
+        "                     (insecure: visible in ps/shell history — prefer --auth-file)"
+    );
+    let _ = writeln!(
+        w,
+        "      --auth-file F  Read the bearer token from the first line of file F"
+    );
+    let _ = writeln!(
+        w,
+        "      --install      Install and start as a launchd user agent"
+    );
+    let _ = writeln!(w, "      --uninstall    Stop and remove the launchd agent");
+    let _ = writeln!(w, "  -h, --help         Show this help");
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Endpoints:  GET /json   GET /metrics");
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Examples:");
+    let _ = writeln!(w, "  power-monitor serve");
+    let _ = writeln!(w, "  curl http://127.0.0.1:9090/json");
+    let _ = writeln!(
+        w,
+        "  power-monitor serve --bind 0.0.0.0 --auth-file ~/.pm-token --install"
+    );
 }
 
 /// Entry point for `power-monitor serve`.
@@ -167,7 +230,8 @@ pub fn run(args: &[String]) {
     let mut bind: String = "127.0.0.1".to_string();
     let mut port: u16 = 9090;
     let mut interval_ms: u64 = 1000;
-    let mut auth: Option<String> = None;
+    let mut auth_token: Option<String> = None;
+    let mut auth_file: Option<String> = None;
     let mut install = false;
     let mut uninstall = false;
 
@@ -179,11 +243,14 @@ pub fn run(args: &[String]) {
             "-i" | "--interval" => {
                 interval_ms = argp::parse_value(args, &mut i, "--interval", "interval")
             }
-            "--auth" => auth = Some(argp::take_value(args, &mut i, "--auth").to_string()),
+            "--auth" => auth_token = Some(argp::take_value(args, &mut i, "--auth").to_string()),
+            "--auth-file" => {
+                auth_file = Some(argp::take_value(args, &mut i, "--auth-file").to_string())
+            }
             "--install" => install = true,
             "--uninstall" => uninstall = true,
             "-h" | "--help" => {
-                print_usage();
+                write_usage(&mut std::io::stdout().lock());
                 return;
             }
             other => argp::unknown_arg(other),
@@ -191,15 +258,25 @@ pub fn run(args: &[String]) {
         i += 1;
     }
 
+    argp::check_auth_exclusive(&auth_token, &auth_file);
+
     if uninstall {
         do_uninstall();
         return;
     }
 
     if install {
-        do_install(&bind, port, interval_ms, auth.as_deref());
+        let auth_arg = match (&auth_token, &auth_file) {
+            (Some(t), _) => argp::AuthArg::Inline(t),
+            (None, Some(p)) => argp::AuthArg::File(p),
+            (None, None) => argp::AuthArg::None,
+        };
+        do_install(&bind, port, interval_ms, auth_arg);
         return;
     }
+
+    // Serving path: resolve the file token now (install passed the path through).
+    let auth = argp::resolve_auth(auth_token, auth_file);
 
     // Start sampler on a background thread, updating shared Metrics.
     let mut sampler = power_monitor::Sampler::new().unwrap_or_else(|| {

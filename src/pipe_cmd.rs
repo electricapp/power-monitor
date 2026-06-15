@@ -9,10 +9,31 @@ use std::io::Write;
 
 use power_monitor::serialize::{AgentInfo, write_metrics_json};
 
-fn print_usage() {
-    eprintln!("Usage: power-monitor pipe [-s <samples>] [-i <interval_ms>]");
-    eprintln!("  -s, --samples   N samples then exit (default 0 = infinite)");
-    eprintln!("  -i, --interval  Sampling window in ms (default 1000)");
+pub(crate) fn write_usage(w: &mut impl Write) {
+    let _ = writeln!(
+        w,
+        "Usage: power-monitor pipe [-s <samples>] [-i <interval_ms>]"
+    );
+    let _ = writeln!(w);
+    let _ = writeln!(
+        w,
+        "Stream one JSON object per sample window to stdout (NDJSON)."
+    );
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Options:");
+    let _ = writeln!(
+        w,
+        "  -s, --samples N   Stop after N samples (default 0 = infinite)"
+    );
+    let _ = writeln!(
+        w,
+        "  -i, --interval N  Sampling window in ms (default 1000)"
+    );
+    let _ = writeln!(w, "  -h, --help        Show this help");
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Examples:");
+    let _ = writeln!(w, "  power-monitor pipe | jq");
+    let _ = writeln!(w, "  power-monitor pipe -s 10 -i 500 > metrics.ndjson");
 }
 
 /// Entry point for `power-monitor pipe`.
@@ -30,7 +51,7 @@ pub fn run(args: &[String]) {
                 interval_ms = args::parse_value(args, &mut i, "--interval", "interval")
             }
             "-h" | "--help" => {
-                print_usage();
+                write_usage(&mut std::io::stdout().lock());
                 return;
             }
             other => args::unknown_arg(other),

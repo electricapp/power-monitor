@@ -188,9 +188,7 @@ impl Decoder {
         match self {
             Decoder::Flt => bytes[..4].copy_from_slice(&value.to_le_bytes()),
             Decoder::Sp78 => bytes[..2].copy_from_slice(&((value * 256.0) as i16).to_le_bytes()),
-            Decoder::Ioft => {
-                bytes[..4].copy_from_slice(&((value * 65536.0) as u32).to_le_bytes())
-            }
+            Decoder::Ioft => bytes[..4].copy_from_slice(&((value * 65536.0) as u32).to_le_bytes()),
             Decoder::Ui8 => bytes[0] = value as u8,
             Decoder::Ui16 => bytes[..2].copy_from_slice(&(value as u16).to_be_bytes()),
             Decoder::Si16 => bytes[..2].copy_from_slice(&(value as i16).to_be_bytes()),
@@ -500,14 +498,18 @@ impl Smc {
         let key_u32 = four_cc(key);
         if let Some(&entry) = self.cache.borrow().get(&key_u32) {
             return match entry {
-                Some(rk) => self.write_resolved(rk, value).map_err(SmcWriteError::IoError),
+                Some(rk) => self
+                    .write_resolved(rk, value)
+                    .map_err(SmcWriteError::IoError),
                 None => Err(SmcWriteError::KeyNotFound),
             };
         }
         let resolved = self.resolve_key(key);
         self.cache.borrow_mut().insert(key_u32, resolved);
         match resolved {
-            Some(rk) => self.write_resolved(rk, value).map_err(SmcWriteError::IoError),
+            Some(rk) => self
+                .write_resolved(rk, value)
+                .map_err(SmcWriteError::IoError),
             None => Err(SmcWriteError::KeyNotFound),
         }
     }
@@ -583,7 +585,11 @@ impl Smc {
             if info.data_size == 0 {
                 return None;
             }
-            Some((info.data_size, info.data_type.to_be_bytes(), info.data_attributes))
+            Some((
+                info.data_size,
+                info.data_type.to_be_bytes(),
+                info.data_attributes,
+            ))
         }
     }
 
@@ -730,7 +736,11 @@ impl Smc {
     /// Number of fans present (0–2). Zero on fanless hardware.
     pub fn fan_count(&self) -> u8 {
         let raw = self.read(K_FNUM);
-        if raw.is_finite() { raw.clamp(0.0, 2.0) as u8 } else { 0 }
+        if raw.is_finite() {
+            raw.clamp(0.0, 2.0) as u8
+        } else {
+            0
+        }
     }
 
     /// Hardware maximum RPM for the given fan index (0 or 1).

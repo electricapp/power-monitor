@@ -1,8 +1,9 @@
 use power_monitor::Smc;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 unsafe extern "C" {
-    fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+    fn signal(sig: i32, handler: usize) -> usize;
 }
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
@@ -11,14 +12,35 @@ extern "C" fn handle_signal(_sig: i32) {
     RUNNING.store(false, Ordering::SeqCst);
 }
 
+pub(crate) fn write_usage(w: &mut impl Write) {
+    let _ = writeln!(w, "Usage: power-monitor fan <max|auto>");
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Control fan speed. Requires root — run with sudo.");
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Subcommands:");
+    let _ = writeln!(
+        w,
+        "  max    Force all fans to maximum RPM (hold until SIGINT/SIGTERM)"
+    );
+    let _ = writeln!(w, "  auto   Restore automatic fan control");
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Examples:");
+    let _ = writeln!(w, "  sudo power-monitor fan max");
+    let _ = writeln!(w, "  sudo power-monitor fan auto");
+}
+
 pub fn run(args: &[String]) {
     match args.first().map(String::as_str) {
         Some("max") => run_max(),
         Some("auto") => run_auto(),
-        _ => {
-            eprintln!("Usage: power-monitor fan <max|auto>");
-            eprintln!("  max   Set all fans to maximum RPM (hold until SIGTERM/SIGINT)");
-            eprintln!("  auto  Restore automatic fan control");
+        Some("-h") | Some("--help") => write_usage(&mut std::io::stdout().lock()),
+        other => {
+            if let Some(arg) = other {
+                eprintln!("error: unknown fan command: {arg}");
+            } else {
+                eprintln!("error: fan requires a subcommand");
+            }
+            write_usage(&mut std::io::stderr().lock());
             std::process::exit(2);
         }
     }
@@ -56,8 +78,8 @@ fn run_max() {
     }
 
     unsafe {
-        signal(2, handle_signal); // SIGINT
-        signal(15, handle_signal); // SIGTERM
+        signal(2, handle_signal as *const () as usize); // SIGINT
+        signal(15, handle_signal as *const () as usize); // SIGTERM
     }
 
     if let Err(e) = smc.set_fans_max() {

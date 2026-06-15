@@ -276,9 +276,11 @@ pub const PROM_GAUGES: &[PromGauge] = &[
         "GPU temperature in degrees Celsius",
         |m| m.gpu_temp as f64,
     ),
-    ("fan_rpm", "Highest-duty fan current RPM (0 if fanless)", |m| {
-        m.fan_rpm as f64
-    }),
+    (
+        "fan_rpm",
+        "Highest-duty fan current RPM (0 if fanless)",
+        |m| m.fan_rpm as f64,
+    ),
     (
         "fan_max_rpm",
         "Highest-duty fan max RPM (0 if fanless)",
