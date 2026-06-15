@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref (e.g. force-pushes to a PR branch).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Mirror release-crate.sh: any warning fails the gate.
+  RUSTFLAGS: "-D warnings"
+
+# Every `uses:` is pinned to a full commit SHA for supply-chain safety; the
+# trailing comment is the semver tag that SHA corresponds to (dependabot keeps
+# both in sync). dtolnay/rust-toolchain only ships the `v1` action tag — the
+# Rust channel it installs is selected via the `toolchain:` input, never the ref.
+jobs:
+  # Formatting only needs to parse the source — no IOKit/IOReport linking —
+  # so it runs on cheap (and for public repos, free) Linux runners.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install Rust (stable + rustfmt)
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # clippy, tests, and docs all link the macOS frameworks (IOKit,
+  # CoreFoundation, IOReport) and gate on `cfg(target_os = "macos")`, so they
+  # must run on an Apple Silicon macOS runner (macos-latest is arm64).
+  build:
+    name: clippy + test + doc
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: cargo clippy --all-targets
+        run: cargo clippy --all-targets -- -D warnings
+
+      # --release matches release-crate.sh: the zero-alloc tests in
+      # tests/no_alloc.rs depend on the optimizer and are only meaningful in
+      # release mode. Hardware-dependent assertions skip gracefully when
+      # IOReport is unavailable on the runner VM.
+      - name: cargo test --release
+        run: cargo test --release
+
+      - name: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings -D rustdoc::broken-intra-doc-links -D rustdoc::private-intra-doc-links -D rustdoc::invalid-codeblock-attributes"
+        run: cargo doc --no-deps
+
+  # Verify the crate still builds on the declared MSRV (Cargo.toml
+  # rust-version). Catches accidental use of newer-than-supported APIs.
+  msrv:
+    name: msrv (1.96)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install Rust 1.96.0
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: cargo build (MSRV)
+        run: cargo build --all-targets

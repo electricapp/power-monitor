@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Rust crate dependencies (Cargo.toml / Cargo.lock). Runtime deps are
+  # currently zero; this mostly tracks dev-deps (criterion) and their
+  # transitive lockfile entries.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 99
+    commit-message:
+      prefix: "deps"
+    labels:
+      - "dependencies"
+      - "rust"
+
+  # The GitHub Actions used by the workflows in .github/workflows.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 99
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "github-actions"
