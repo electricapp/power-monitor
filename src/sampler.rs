@@ -197,7 +197,7 @@ impl Sampler {
     /// IOReport channels are sub-sampled `samples_per_window` times for
     /// smoothing; SMC thermals, power, and memory are read **once** at
     /// the end of the window (they change slowly compared to the sampling
-    /// rate). Each sub-sample dwells at least [`MIN_SUB_MS`] milliseconds
+    /// rate). Each sub-sample dwells at least `MIN_SUB_MS` milliseconds
     /// regardless of `duration_ms`, so the actual call duration is
     /// `max(duration_ms, samples_per_window * MIN_SUB_MS)`.
     ///
