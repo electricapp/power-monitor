@@ -43,6 +43,16 @@ pub fn unknown_arg(arg: &str) -> ! {
     std::process::exit(2);
 }
 
+/// Reject a zero sampling interval. `get_metrics(0)` returns immediately, so a
+/// zero interval turns the sample loop into a busy-spin that pegs a core. Exits
+/// with code 2.
+pub fn require_positive_interval(interval_ms: u64) {
+    if interval_ms == 0 {
+        eprintln!("error: --interval must be greater than 0");
+        std::process::exit(2);
+    }
+}
+
 // ── Bearer-token plumbing (shared by `serve` and `collect`) ──────────────────
 //
 // A `--auth TOKEN` flag leaks the secret into `ps` output and shell history,

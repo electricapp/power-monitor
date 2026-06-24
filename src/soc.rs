@@ -71,6 +71,10 @@ unsafe extern "C" {
     fn CFStringCreateWithCString(alloc: *const c_void, s: *const u8, enc: u32) -> *const c_void;
     pub fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
     pub fn CFDataGetLength(data: *const c_void) -> isize;
+    /// Runtime type identifier of a CF object (`CFTypeID` is `unsigned long`).
+    pub fn CFGetTypeID(cf: *const c_void) -> usize;
+    /// The `CFTypeID` shared by all `CFData` objects.
+    pub fn CFDataGetTypeID() -> usize;
 }
 
 const CF_UTF8: u32 = 0x0800_0100;
@@ -180,8 +184,13 @@ fn sysctl_u64s(name: &str) -> Vec<u64> {
 
 // ── IOKit helpers ─────────────────────────────────────────────────────────────
 
+/// Create a `CFString` from `s`. Returns null (not a panic) if `s` contains an
+/// interior NUL or the encoding fails; callers must null-check before use and
+/// must not `CFRelease` a null result.
 fn cfstr_raw(s: &str) -> *const c_void {
-    let cs = CString::new(s).unwrap();
+    let Ok(cs) = CString::new(s) else {
+        return std::ptr::null();
+    };
     unsafe { CFStringCreateWithCString(std::ptr::null(), cs.as_ptr() as *const u8, CF_UTF8) }
 }
 
@@ -190,14 +199,29 @@ fn cfstr_raw(s: &str) -> *const c_void {
 unsafe fn read_iokit_data<T: Copy>(service: u32, property_name: &str) -> Vec<T> {
     unsafe {
         let key = cfstr_raw(property_name);
+        if key.is_null() {
+            return Vec::new();
+        }
         let prop = IORegistryEntryCreateCFProperty(service, key, std::ptr::null(), 0);
         CFRelease(key);
         if prop.is_null() {
             return Vec::new();
         }
 
+        // The property may be any CF type (CFNumber, CFString, …). Calling the
+        // CFData accessors on a non-CFData object is undefined behaviour, so
+        // verify the runtime type first and release otherwise.
+        if CFGetTypeID(prop) != CFDataGetTypeID() {
+            CFRelease(prop);
+            return Vec::new();
+        }
+
         let len = CFDataGetLength(prop) as usize;
         let bytes = CFDataGetBytePtr(prop);
+        if bytes.is_null() {
+            CFRelease(prop);
+            return Vec::new();
+        }
         let count = len / mem::size_of::<T>();
         let mut out = Vec::with_capacity(count);
         for i in 0..count {
@@ -392,6 +416,10 @@ fn read_iokit_u32(service_name: &str, property_name: &str) -> Option<u32> {
         }
 
         let key = cfstr_raw(property_name);
+        if key.is_null() {
+            IOObjectRelease(service);
+            return None;
+        }
         let prop = IORegistryEntryCreateCFProperty(service, key, std::ptr::null(), 0);
         CFRelease(key);
         IOObjectRelease(service);

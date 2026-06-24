@@ -26,9 +26,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::http::{
-    MAX_INFLIGHT, extract_bearer, extract_path, http_response, read_request_head, try_acquire,
+    MAX_INFLIGHT, constant_time_eq, extract_bearer, extract_path, http_response, read_request_head,
+    try_acquire,
 };
 use power_monitor::Metrics;
+use power_monitor::serialize::write_prom_label;
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 
@@ -709,13 +711,16 @@ fn fleet_to_prometheus(fleet: &[Mutex<HostState>]) -> String {
         );
         for (chip, host, m) in &rendered {
             let v = value(m);
-            if v.is_nan() {
+            // Drop non-finite samples (NaN rail-gated temps, or a remote agent
+            // reporting ±inf) — they're invalid Prometheus exposition text.
+            if !v.is_finite() {
                 continue;
             }
-            let _ = writeln!(
-                out,
-                "power_monitor_{name}{{chip=\"{chip}\",host=\"{host}\"}} {v:.3}"
-            );
+            let _ = write!(out, "power_monitor_{name}{{chip=\"");
+            let _ = write_prom_label(&mut out, chip);
+            let _ = write!(out, "\",host=\"");
+            let _ = write_prom_label(&mut out, host);
+            let _ = writeln!(out, "\"}} {v:.3}");
         }
     }
 
@@ -731,14 +736,13 @@ fn fleet_to_prometheus(fleet: &[Mutex<HostState>]) -> String {
             .as_ref()
             .map(|p| p.hostname.as_str())
             .unwrap_or(&live.label);
-        let _ = writeln!(
-            out,
-            "power_monitor_host_up{{chip=\"{}\",host=\"{}\",target=\"{}\"}} {}",
-            chip,
-            host,
-            live.target,
-            u8::from(live.up)
-        );
+        let _ = write!(out, "power_monitor_host_up{{chip=\"");
+        let _ = write_prom_label(&mut out, chip);
+        let _ = write!(out, "\",host=\"");
+        let _ = write_prom_label(&mut out, host);
+        let _ = write!(out, "\",target=\"");
+        let _ = write_prom_label(&mut out, &live.target);
+        let _ = writeln!(out, "\"}} {}", u8::from(live.up));
     }
 
     out
@@ -792,14 +796,13 @@ fn handle_connection(
         return;
     }
 
-    if let Some(required) = auth {
-        let presented = extract_bearer(&buf);
-        if presented != Some(required) {
-            let body = "{\"error\":\"unauthorized\"}";
-            let response = http_response("401 Unauthorized", "application/json", body);
-            stream.write_all(&response).ok();
-            return;
-        }
+    if let Some(required) = auth
+        && !constant_time_eq(extract_bearer(&buf), required)
+    {
+        let body = "{\"error\":\"unauthorized\"}";
+        let response = http_response("401 Unauthorized", "application/json", body);
+        stream.write_all(&response).ok();
+        return;
     }
 
     let path = extract_path(&buf).unwrap_or_default();
@@ -1072,6 +1075,8 @@ pub fn run(args: &[String]) {
         return;
     }
 
+    argp::require_positive_interval(interval_ms);
+
     // Resolve host list: --tailnet runs discovery, otherwise use --host.
     if tailnet {
         if hosts_arg.is_some() {
@@ -1165,6 +1170,12 @@ pub fn run(args: &[String]) {
             Ok(s) => s,
             Err(_) => continue,
         };
+        // Slowloris defense (see serve_cmd): reap clients that stall mid-request
+        // so they can't exhaust the MAX_INFLIGHT handler budget. The write
+        // timeout is generous so the long-lived `/stream` SSE push loop (one
+        // write per poll interval) isn't tripped under normal cadence.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
         let Some(permit) = try_acquire(&inflight, MAX_INFLIGHT) else {
             let body = "{\"error\":\"server busy\"}";
             let response = http_response("503 Service Unavailable", "application/json", body);

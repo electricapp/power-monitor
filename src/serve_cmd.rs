@@ -7,10 +7,13 @@ use std::sync::atomic::AtomicUsize;
 use power_monitor::Metrics;
 
 use crate::http::{
-    MAX_INFLIGHT, extract_bearer, extract_path, http_response, read_request_head, try_acquire,
+    MAX_INFLIGHT, constant_time_eq, extract_bearer, extract_path, http_response, read_request_head,
+    try_acquire,
 };
 use crate::seqlock::SeqLock;
-use power_monitor::serialize::{AgentInfo, PROM_GAUGES, metrics_to_json, utc_now};
+use power_monitor::serialize::{
+    AgentInfo, PROM_GAUGES, metrics_to_json, utc_now, write_prom_label,
+};
 
 // ── Prometheus format ─────────────────────────────────────────────────────────
 
@@ -23,11 +26,14 @@ fn metrics_to_prometheus(m: &Metrics, chip: &str, host: &str) -> String {
             "# HELP power_monitor_{name} {help}\n# TYPE power_monitor_{name} gauge\n"
         );
         let v = value(m);
-        if !v.is_nan() {
-            let _ = writeln!(
-                out,
-                "power_monitor_{name}{{chip=\"{chip}\",host=\"{host}\"}} {v:.3}"
-            );
+        // Skip non-finite samples entirely (rail-gated temps are NaN; ±inf
+        // would be invalid exposition text) rather than emit a bad line.
+        if v.is_finite() {
+            let _ = write!(out, "power_monitor_{name}{{chip=\"");
+            let _ = write_prom_label(&mut out, chip);
+            let _ = write!(out, "\",host=\"");
+            let _ = write_prom_label(&mut out, host);
+            let _ = writeln!(out, "\"}} {v:.3}");
         }
     }
     out
@@ -265,6 +271,8 @@ pub fn run(args: &[String]) {
         return;
     }
 
+    argp::require_positive_interval(interval_ms);
+
     if install {
         let auth_arg = match (&auth_token, &auth_file) {
             (Some(t), _) => argp::AuthArg::Inline(t),
@@ -322,6 +330,13 @@ pub fn run(args: &[String]) {
             Err(_) => continue,
         };
 
+        // Slowloris defense: a client that connects but drips (or never sends)
+        // the request would otherwise pin a handler thread forever. With only
+        // MAX_INFLIGHT slots, a handful of idle connections wedge the server at
+        // 503 for everyone. Bound the read so stalled clients are reaped.
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+
         let Some(permit) = try_acquire(&inflight, MAX_INFLIGHT) else {
             let body = "{\"error\":\"server busy\"}";
             let response = http_response("503 Service Unavailable", "application/json", body);
@@ -355,14 +370,13 @@ fn handle_connection(
     }
 
     // Enforce auth before routing.
-    if let Some(required) = auth {
-        let presented = extract_bearer(&buf);
-        if presented != Some(required) {
-            let body = "{\"error\":\"unauthorized\"}";
-            let response = http_response("401 Unauthorized", "application/json", body);
-            stream.write_all(&response).ok();
-            return;
-        }
+    if let Some(required) = auth
+        && !constant_time_eq(extract_bearer(&buf), required)
+    {
+        let body = "{\"error\":\"unauthorized\"}";
+        let response = http_response("401 Unauthorized", "application/json", body);
+        stream.write_all(&response).ok();
+        return;
     }
 
     let path = extract_path(&buf).unwrap_or_default();

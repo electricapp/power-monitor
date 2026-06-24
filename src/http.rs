@@ -50,7 +50,10 @@ pub fn read_request_head(stream: &mut impl Read) -> Vec<u8> {
     // read boundary is still caught while the search stays O(total bytes).
     let mut scanned = 0usize;
     while buf.len() < MAX_HEADER_BYTES {
-        let n = match stream.read(&mut chunk) {
+        // Never read more than the remaining budget, so `buf` is capped at
+        // exactly MAX_HEADER_BYTES rather than overshooting by up to a chunk.
+        let want = (MAX_HEADER_BYTES - buf.len()).min(chunk.len());
+        let n = match stream.read(&mut chunk[..want]) {
             Ok(0) => break,
             Ok(n) => n,
             Err(_) => break,
@@ -91,6 +94,29 @@ pub fn extract_path(buf: &[u8]) -> Option<String> {
     parts.next()?; // method
     let path = parts.next()?;
     Some(path.to_string())
+}
+
+/// Constant-time comparison of a presented bearer token against the expected
+/// one. Avoids leaking the length of the matching prefix via early-return
+/// timing — `&str`'s `==` short-circuits on the first mismatching byte, which a
+/// networked attacker can exploit to recover the token byte-by-byte.
+///
+/// The length check still reveals whether the lengths match, which is
+/// acceptable for fixed-length secrets; the byte loop runs in time proportional
+/// only to the (public) expected length.
+pub fn constant_time_eq(presented: Option<&str>, expected: &str) -> bool {
+    let Some(presented) = presented else {
+        return false;
+    };
+    let (a, b) = (presented.as_bytes(), expected.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Look for a bearer token in the `Authorization` header of a raw request.
@@ -162,6 +188,19 @@ mod tests {
     fn extract_bearer_wrong_scheme_returns_none() {
         let req = b"GET / HTTP/1.1\r\nAuthorization: Basic ZGVtbw==\r\n\r\n";
         assert!(extract_bearer(req).is_none());
+    }
+
+    #[test]
+    fn constant_time_eq_matches() {
+        assert!(constant_time_eq(Some("s3cret"), "s3cret"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_mismatch_and_none() {
+        assert!(!constant_time_eq(Some("s3cret"), "s3crit"));
+        assert!(!constant_time_eq(Some("short"), "longer-token"));
+        assert!(!constant_time_eq(Some(""), "x"));
+        assert!(!constant_time_eq(None, "s3cret"));
     }
 
     #[test]

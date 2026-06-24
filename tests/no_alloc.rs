@@ -82,6 +82,46 @@ fn full_sampler_get_metrics_is_zero_alloc_after_warmup() {
 }
 
 #[test]
+fn write_metrics_json_is_zero_alloc_into_reused_buffer() {
+    // The `pipe`/`serve` per-tick loops claim to serialize with zero per-frame
+    // allocations into a reused buffer. The sampler-level tests don't cover the
+    // serializer, so verify it directly — no hardware needed.
+    use power_monitor::Metrics;
+    use power_monitor::serialize::{AgentInfo, write_metrics_json};
+
+    let _guard = MEASURE_LOCK.lock().unwrap();
+
+    let info = AgentInfo {
+        version: "0.1.0",
+        hostname: "testhost".to_string(),
+        chip: "Apple M-test".to_string(),
+        pcpu_cores: 4,
+        ecpu_cores: 4,
+        gpu_cores: 10,
+        interval_ms: 1000,
+    };
+    let m = Metrics::default();
+
+    // Warm-up writes grow the buffer to its steady-state capacity; `clear()`
+    // keeps that capacity so the measured write reuses the same allocation.
+    let mut buf = String::with_capacity(1024);
+    write_metrics_json(&mut buf, &m, &info).unwrap();
+    buf.clear();
+
+    ALLOCS.store(0, Ordering::Relaxed);
+    COUNTING.store(true, Ordering::Relaxed);
+    write_metrics_json(&mut buf, &m, &info).unwrap();
+    std::hint::black_box(&buf);
+    COUNTING.store(false, Ordering::Relaxed);
+
+    let count = ALLOCS.load(Ordering::Relaxed);
+    assert_eq!(
+        count, 0,
+        "write_metrics_json() allocated {count} times into a pre-grown buffer"
+    );
+}
+
+#[test]
 fn multigroup_sampler_is_zero_alloc_after_warmup() {
     let _guard = MEASURE_LOCK.lock().unwrap();
     // Skip gracefully when IOReport is unavailable (e.g. inside a VM).

@@ -166,17 +166,17 @@ pub fn write_metrics_json<W: std::fmt::Write>(
         ec = info.ecpu_cores,
         gc = info.gpu_cores,
         iv = info.interval_ms,
-        sys = m.sys_power,
-        cpu = m.cpu_power,
-        gpu = m.gpu_power,
-        ane = m.ane_power,
-        dram = m.dram_power,
-        all = m.all_power,
-        eu = m.ecpu.utilization,
+        sys = finite_or_zero(m.sys_power),
+        cpu = finite_or_zero(m.cpu_power),
+        gpu = finite_or_zero(m.gpu_power),
+        ane = finite_or_zero(m.ane_power),
+        dram = finite_or_zero(m.dram_power),
+        all = finite_or_zero(m.all_power),
+        eu = finite_or_zero(m.ecpu.utilization),
         ef = m.ecpu.freq_mhz,
-        pu = m.pcpu.utilization,
+        pu = finite_or_zero(m.pcpu.utilization),
         pf = m.pcpu.freq_mhz,
-        gu = m.gpu_util,
+        gu = finite_or_zero(m.gpu_util),
         gf = m.gpu_freq_mhz,
     )?;
     // Temps are the only fields that legitimately go NaN (rail-gated sensors).
@@ -300,6 +300,37 @@ pub const PROM_GAUGES: &[PromGauge] = &[
     }),
 ];
 
+/// Escape a Prometheus label *value* into `out`.
+///
+/// The exposition format requires `\`, `"`, and newline inside a label value to
+/// be escaped as `\\`, `\"`, and `\n` respectively. Label values can carry
+/// remote-controlled data (a polled agent's reported `chip`/`hostname`), so
+/// failing to escape them lets a malicious agent break out of the label and
+/// forge arbitrary metrics in the collector's scrape output. This is *not* the
+/// same escape set as JSON (e.g. no `\t`), so it gets its own helper.
+pub fn write_prom_label<W: std::fmt::Write>(out: &mut W, s: &str) -> std::fmt::Result {
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.write_str("\\\\")?,
+            '"' => out.write_str("\\\"")?,
+            '\n' => out.write_str("\\n")?,
+            c => out.write_char(c)?,
+        }
+    }
+    Ok(())
+}
+
+/// Substitute `0.0` for a non-finite float so serialized output stays valid.
+///
+/// Rust formats `f64::NAN`/`INFINITY` as `NaN`/`inf`, which are invalid JSON and
+/// invalid Prometheus. Power/utilisation gauges are never legitimately
+/// non-finite (unlike rail-gated temps, which serialize as `null`), so coercing
+/// to `0.0` keeps the wire format parseable if a bad value ever slips through.
+#[inline]
+pub fn finite_or_zero(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
+}
+
 /// JSON-escape `s` into `out`. Handles the standard escapes plus control chars.
 pub fn write_escape_json<W: std::fmt::Write>(out: &mut W, s: &str) -> std::fmt::Result {
     for ch in s.chars() {
@@ -404,6 +435,31 @@ mod tests {
     fn leap_year_2400_is_leap() {
         let d = days_from_civil(2400, 2, 29);
         assert_eq!(days_to_ymd(d), (2400, 2, 29));
+    }
+
+    fn prom_label(s: &str) -> String {
+        let mut out = String::new();
+        write_prom_label(&mut out, s).unwrap();
+        out
+    }
+
+    #[test]
+    fn prom_label_escapes_injection_chars() {
+        // A malicious agent reporting this `chip` must not be able to break out
+        // of the label value and forge metrics.
+        assert_eq!(prom_label(r#"M5",evil="1"#), r#"M5\",evil=\"1"#);
+        assert_eq!(prom_label("a\\b"), "a\\\\b");
+        assert_eq!(prom_label("line1\nline2"), "line1\\nline2");
+        assert_eq!(prom_label("Apple M5"), "Apple M5");
+    }
+
+    #[test]
+    fn finite_or_zero_coerces_non_finite() {
+        assert_eq!(finite_or_zero(3.5), 3.5);
+        assert_eq!(finite_or_zero(0.0), 0.0);
+        assert_eq!(finite_or_zero(f32::NAN), 0.0);
+        assert_eq!(finite_or_zero(f32::INFINITY), 0.0);
+        assert_eq!(finite_or_zero(f32::NEG_INFINITY), 0.0);
     }
 
     #[test]

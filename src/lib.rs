@@ -322,6 +322,10 @@ pub enum SmcWriteError {
     /// `IOConnectCallStructMethod` failed with the given `kern_return_t` code.
     /// Common cause: writing without root privileges.
     IoError(i32),
+    /// The value to write is non-finite (NaN/±∞) or otherwise outside the safe
+    /// range for the key. Rejected before touching hardware — e.g. refusing to
+    /// command a fan to 0 RPM when its max-RPM key reads back as 0.
+    InvalidValue,
 }
 
 impl std::fmt::Display for SmcWriteError {
@@ -329,6 +333,9 @@ impl std::fmt::Display for SmcWriteError {
         match self {
             SmcWriteError::KeyNotFound => write!(f, "SMC key not found on this hardware"),
             SmcWriteError::IoError(kr) => write!(f, "SMC write failed: kern_return_t {kr}"),
+            SmcWriteError::InvalidValue => {
+                write!(f, "refused to write an unsafe/out-of-range SMC value")
+            }
         }
     }
 }
@@ -435,10 +442,21 @@ impl Smc {
                 output.as_mut_ptr(),
                 &mut output_size,
             );
-            if kr != 0 {
+            // The kernel writes the actual returned byte count back into
+            // `output_size`; a short struct means the fields below are partly
+            // uninitialised, so treat it as a failed read.
+            if kr != 0 || output_size < mem::size_of::<SmcKeyData>() {
                 return None;
             }
-            Some(rk.decoder.decode(&output.assume_init_ref().bytes))
+            // SAFETY: a full-size struct was returned on success.
+            let out = output.assume_init_ref();
+            // AppleSMC reports an in-band status even when the mach call
+            // succeeds (e.g. 0x84 = key-not-found, 0x85 = bad argument). A
+            // non-zero `result` means `bytes` is not a valid reading.
+            if out.result != 0 {
+                return None;
+            }
+            Some(rk.decoder.decode(&out.bytes))
         }
     }
 
@@ -495,6 +513,12 @@ impl Smc {
     ///
     /// Returns `Err` if the key is absent or the kernel rejects the write.
     pub fn write_f32(&self, key: &[u8; 4], value: f32) -> Result<(), SmcWriteError> {
+        // Never encode a non-finite value: the integer encoders saturate NaN to
+        // 0, which would silently command e.g. a fan target of 0 RPM. Reject at
+        // the single write choke-point so no caller can slip one through.
+        if !value.is_finite() {
+            return Err(SmcWriteError::InvalidValue);
+        }
         let key_u32 = four_cc(key);
         if let Some(&entry) = self.cache.borrow().get(&key_u32) {
             return match entry {
@@ -767,6 +791,16 @@ impl Smc {
         let count = self.fan_count() as usize;
         for i in 0..count {
             let max_rpm = self.fan_max_rpm(i as u8);
+            // If the max-RPM key is absent or its read failed, `fan_max_rpm`
+            // returns 0.0 (or NaN). Forcing the fan to manual mode and then
+            // commanding that value would pin the fan *off* under thermal load —
+            // the opposite of "max". Refuse before touching forced mode so the
+            // OS thermal manager stays in control.
+            if !max_rpm.is_finite() || max_rpm <= 0.0 {
+                // Best-effort: make sure nothing we did is left forced.
+                let _ = self.set_fans_auto();
+                return Err(SmcWriteError::InvalidValue);
+            }
             if let Err(e) = self
                 .write_f32(MODE[i], 1.0)
                 .and_then(|()| self.write_f32(TARGET[i], max_rpm))
@@ -810,11 +844,16 @@ impl Smc {
                 output.as_mut_ptr(),
                 &mut output_size,
             );
-            if kr != 0 {
+            if kr != 0 || output_size < mem::size_of::<SmcKeyData>() {
                 return None;
             }
 
-            let info = output.assume_init_ref().key_info;
+            // SAFETY: a full-size struct was returned on success.
+            let out = output.assume_init_ref();
+            if out.result != 0 {
+                return None;
+            }
+            let info = out.key_info;
             if info.data_size == 0 {
                 return None;
             }
