@@ -1,0 +1,16 @@
+# typos (crate-ci/typos) allowlist for the `typos` CI job.
+#
+# Every entry below is a FALSE POSITIVE: a real domain term, crate name, or
+# accepted spelling that typos' generic dictionary mistakes for a misspelling.
+# Each maps the word to itself so it is treated as correct. No genuine
+# misspellings are suppressed here.
+[default.extend-words]
+# "ANE" = Apple Neural Engine — a SoC compute block this tool measures.
+# Pervasive as the `ane`/`ane_power` field name and the IOReport "ANE"
+# channel label; typos otherwise reads it as a typo of "and"/"one".
+ane = "ane"
+# "ratatui" = the Rust TUI crate (referenced in README); not "ratatouille".
+ratatui = "ratatui"
+# "unparseable" = accepted English spelling used in a doc comment
+# (typos prefers "unparsable"; both are valid).
+unparseable = "unparseable"
