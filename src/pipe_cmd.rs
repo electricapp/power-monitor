@@ -59,6 +59,8 @@ pub fn run(args: &[String]) {
         i += 1;
     }
 
+    args::require_positive_interval(interval_ms);
+
     let mut sampler = power_monitor::Sampler::new().unwrap_or_else(|| {
         eprintln!("error: failed to open Sampler");
         std::process::exit(1);

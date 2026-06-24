@@ -19,6 +19,17 @@
 //!   that value transiently must not be UB. Plain numeric structs (no enums
 //!   with niche optimizations, no references, no `bool` validity invariants)
 //!   are safe. The seqlock retry guarantees the *returned* value is consistent.
+//!
+//! # A note on the model-level data race
+//!
+//! The payload is read/written with non-atomic `read_volatile`/`write_volatile`.
+//! Under the C++/Rust abstract memory model a concurrent non-atomic read and
+//! write of the same location is a data race (UB) even though the seqlock retry
+//! discards any torn value, so Miri will flag this. It is the same pragmatic
+//! compromise the `seqlock` crate and the Linux kernel seqlocks make: on the
+//! AArch64/x86 targets we run on, these lower to plain word loads/stores with
+//! the fences below providing the real ordering, and the construction is sound
+//! in practice.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering, fence};
@@ -57,22 +68,35 @@ impl<T: Copy> SeqLock<T> {
     /// Read a consistent snapshot. Spins while a write overlaps; on a 1 Hz
     /// writer with a sub-microsecond write window, the retry path is rarely hit.
     pub fn load(&self) -> T {
+        let mut spins = 0u32;
         loop {
             let s1 = self.seq.load(Ordering::Acquire);
-            if s1 & 1 != 0 {
+            if s1 & 1 == 0 {
+                // Even seq → no write was in flight when we sampled `s1`.
+                // SAFETY: single-writer contract; a racing write is detected by
+                // the `s1 == s2` recheck below and retried, so a torn value is
+                // never returned.
+                let value = unsafe { core::ptr::read_volatile(self.data.get()) };
+                // The Acquire fence (not the volatility) is what orders the
+                // payload read *before* the `s2` load: an Acquire fence forbids
+                // any load preceding it from being reordered after a load that
+                // follows it. So the relaxed `s2` is sufficient here.
+                fence(Ordering::Acquire);
+                let s2 = self.seq.load(Ordering::Relaxed);
+                if s1 == s2 {
+                    return value;
+                }
+            }
+            // A write overlapped (odd `s1`, or `s2 != s1`). Back off and retry.
+            // Spin briefly, then yield: the production 1 Hz writer essentially
+            // never lands here, but a future high-rate writer must not be able
+            // to starve a reader pinning a single core.
+            spins = spins.wrapping_add(1);
+            if spins < 64 {
                 core::hint::spin_loop();
-                continue;
+            } else {
+                std::thread::yield_now();
             }
-            // SAFETY: read_volatile prevents the compiler from reordering the
-            // payload read across the bracketing seq loads. If the writer
-            // raced, s2 != s1 below and we retry — the value never escapes.
-            let value = unsafe { core::ptr::read_volatile(self.data.get()) };
-            fence(Ordering::Acquire);
-            let s2 = self.seq.load(Ordering::Relaxed);
-            if s1 == s2 {
-                return value;
-            }
-            core::hint::spin_loop();
         }
     }
 }
