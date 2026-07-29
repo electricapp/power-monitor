@@ -14,13 +14,13 @@ fn main() {
             l.name,
             l.cores,
             l.freqs_mhz.len(),
-            &l.freqs_mhz
+            l.freqs_mhz
         );
     }
     println!(
         "  GPU freqs ({} entries): {:?}",
         soc.gpu_freqs_mhz.len(),
-        &soc.gpu_freqs_mhz
+        soc.gpu_freqs_mhz
     );
 
     // Scan all AppleARMIODevice nodes for voltage-states properties to find M5 names

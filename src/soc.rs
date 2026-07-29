@@ -279,7 +279,7 @@ pub fn probe_voltage_state_properties() {
                         "  node {node_idx}: {prop_name} ({} bytes, {} freqs): {:?}",
                         data.len(),
                         freqs.len(),
-                        &freqs
+                        freqs
                     );
                 } else {
                     println!(
